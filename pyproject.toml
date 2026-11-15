@@ -1,17 +1,18 @@
 [project]
 name = "paperqueue"
-version = "0.1.0"
-description = "A local reading queue for research papers: Zotero sync, Apple Calendar scheduling (synced to iPhone), a localhost web app, and an MCP server so agents can add and schedule papers."
+version = "0.2.0"
+description = "A local reading queue for research papers and YouTube talks: Zotero/Mendeley sync, Apple Calendar scheduling (synced to iPhone), a localhost web app, and an MCP server so agents can add and schedule papers."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-keywords = ["papers", "reading-list", "zotero", "mcp", "calendar", "arxiv"]
+keywords = ["papers", "reading-list", "zotero", "mcp", "calendar", "arxiv", "youtube"]
 dependencies = [
-    "fastapi>=0.110",
+    "fastapi>=0.115",
     "uvicorn>=0.29",
     "httpx>=0.27",
     "mcp>=1.2",
     "segno>=1.6",
+    "yt-dlp[default]>=2025.11.12",
 ]
 
 [project.scripts]

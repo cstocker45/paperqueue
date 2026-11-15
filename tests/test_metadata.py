@@ -275,3 +275,77 @@ def test_page_cap_still_parses_head(router: Router, resolver: Resolver, monkeypa
     monkeypatch.setattr(metadata, "PAGE_CAP", len(PAGE) + 10)
     router.text("example.org", "/big", PAGE + "x" * 10_000)
     assert resolver.resolve("https://example.org/big").title == "A Web Paper & More"
+
+
+# --- YouTube ------------------------------------------------------------------------
+
+VID = "dQw4w9WgXcQ"
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        f"https://www.youtube.com/watch?v={VID}",
+        f"https://youtube.com/watch?v={VID}&t=30s",
+        f"https://www.youtube.com/watch?v={VID}&list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG&index=3",
+        f"https://m.youtube.com/watch?feature=share&v={VID}",
+        f"https://youtu.be/{VID}",
+        f"https://youtu.be/{VID}?si=abc&t=42",
+        f"youtu.be/{VID}",
+        f"https://www.youtube.com/shorts/{VID}",
+        f"https://www.youtube.com/live/{VID}?feature=shared",
+        f"https://www.youtube.com/embed/{VID}",
+        f"  <https://www.youtube.com/watch?v={VID}#t=1m>  ",
+    ],
+)
+def test_parse_youtube(ref: str) -> None:
+    assert parse_ref(ref) == Ref("youtube", VID)
+
+
+@pytest.mark.parametrize(
+    ("ref", "message"),
+    [
+        ("https://www.youtube.com/playlist?list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG", "playlists"),
+        ("https://www.youtube.com/watch?list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG", "playlists"),
+        ("https://www.youtube.com/@SomeChannel", "not a YouTube video"),
+        ("https://youtu.be/short", "not a YouTube video"),
+    ],
+)
+def test_parse_youtube_rejects(ref: str, message: str) -> None:
+    with pytest.raises(MetadataError, match=message):
+        parse_ref(ref)
+
+
+def test_not_youtube_lookalike() -> None:
+    assert parse_ref("https://notyoutube.com/watch?v=dQw4w9WgXcQ").kind == "url"
+
+
+def test_youtube_via_ytdlp(router: Router, resolver: Resolver, ytdlp) -> None:
+    meta = resolver.resolve(f"https://youtu.be/{VID}?t=1")
+    assert (meta.title, meta.authors, meta.year, meta.venue) == ("How Transformers Work", ["Some Channel"], 2024, "YouTube")
+    assert meta.url == f"https://www.youtube.com/watch?v={VID}"
+    assert (meta.video_id, meta.duration_seconds, meta.matched_by) == (VID, 2520, "identifier")
+    assert meta.abstract and len(meta.abstract) <= 1501 and meta.abstract.endswith("…")
+    (args,) = ytdlp.calls
+    assert args[:3] == ["-J", "--no-playlist", "--ignore-no-formats-error"]
+    assert args[-2:] == ["--", meta.url]
+    assert router.requests == []
+
+
+def test_youtube_falls_back_to_oembed(router: Router, resolver: Resolver, ytdlp) -> None:
+    ytdlp.info.clear()  # yt-dlp fails (e.g. no Deno, bot check)
+    router.json("www.youtube.com", "/oembed", {"title": "How Transformers Work", "author_name": "Some Channel"})
+    meta = resolver.resolve(f"https://www.youtube.com/watch?v={VID}")
+    assert (meta.title, meta.authors, meta.video_id, meta.matched_by) == (
+        "How Transformers Work", ["Some Channel"], VID, "oembed")
+    assert meta.duration_seconds is None
+    assert router.requests[0].url.params["url"] == f"https://www.youtube.com/watch?v={VID}"
+
+
+def test_youtube_unavailable(router: Router, resolver: Resolver, ytdlp) -> None:
+    ytdlp.info.clear()
+    router.json("www.youtube.com", "/oembed", {}, status=404)
+    with pytest.raises(MetadataError, match="unavailable"):
+        resolver.resolve(f"https://youtu.be/{VID}")
+    meta = resolver.resolve(f"https://youtu.be/{VID}", {"title": "From the page"})
+    assert (meta.title, meta.video_id, meta.venue, meta.matched_by) == ("From the page", VID, "YouTube", "hints")

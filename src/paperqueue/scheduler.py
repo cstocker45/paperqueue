@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -101,27 +101,30 @@ def next_free(cfg: Config, busy: Busy, after: datetime, duration_min: int) -> da
     return None
 
 
-def _first_free_on(cfg: Config, day: date, busy: Busy, now: datetime) -> datetime | None:
-    duration = cfg.schedule.duration_minutes
+def _first_free_on(cfg: Config, day: date, busy: Busy, now: datetime, duration: int) -> datetime | None:
     for slot in _day_slots(cfg, day, tz(cfg)):
         if slot >= now and not _overlaps(slot, duration, busy):
             return slot
     return None
 
 
-def parse_when(text: str | None, cfg: Config, busy: Busy, now: datetime) -> datetime | None:
+def parse_when(
+    text: str | None, cfg: Config, busy: Busy, now: datetime, duration: int | None = None
+) -> datetime | None:
     """Parse a scheduling request into an aware UTC start time, or None for "unschedule".
 
     Accepts an ISO datetime (naive = configured timezone), YYYY-MM-DD / today / tomorrow /
     a weekday name (first free configured time that day), "next" (next free slot), or
-    "none"/empty. Raises ValueError when the text is not understood or no slot is free."""
+    "none"/empty. A slot is free when `duration` minutes (default: the configured session
+    length) fit. Raises ValueError when the text is not understood or no slot is free."""
+    minutes = duration or cfg.schedule.duration_minutes
     s = (text or "").strip().lower()
     if s in ("", "none", "unschedule", "never"):
         return None
     zone = tz(cfg)
     today = now.astimezone(zone).date()
     if s in ("next", "next free", "next free slot", "soon", "asap"):
-        slot = next_free(cfg, busy, now, cfg.schedule.duration_minutes)
+        slot = next_free(cfg, busy, now, minutes)
         if slot is None:
             raise ValueError(f"no free reading slot in the next {cfg.schedule.horizon_days} days")
         return slot
@@ -135,7 +138,7 @@ def parse_when(text: str | None, cfg: Config, busy: Busy, now: datetime) -> date
         weekday = _DAY_NAMES[s.removeprefix("next ")]
         for offset in range(14):
             candidate = today + timedelta(days=offset)
-            if candidate.weekday() == weekday and _first_free_on(cfg, candidate, busy, now):
+            if candidate.weekday() == weekday and _first_free_on(cfg, candidate, busy, now, minutes):
                 day = candidate
                 break
         if day is None:
@@ -154,22 +157,31 @@ def parse_when(text: str | None, cfg: Config, busy: Busy, now: datetime) -> date
             parsed = parsed.replace(tzinfo=zone)
         return parsed.astimezone(UTC)
 
-    slot = _first_free_on(cfg, day, busy, now)
+    slot = _first_free_on(cfg, day, busy, now, minutes)
     if slot is None:
         raise ValueError(f"no free reading slot left on {day.isoformat()}")
     return slot
 
 
-def plan(papers: Iterable[Paper], cfg: Config, busy: Busy, now: datetime) -> list[tuple[int, datetime]]:
+def plan(
+    papers: Iterable[Paper],
+    cfg: Config,
+    busy: Busy,
+    now: datetime,
+    duration_of: Callable[[Paper], int] | None = None,
+) -> list[tuple[int, datetime]]:
     """Assign papers, best priority and oldest first, to successive free slots.
-    Papers that do not fit in the horizon are left out of the result."""
+    A paper's session lasts its `duration_minutes`, else `duration_of(paper)`, else the
+    configured length. Papers that do not fit in the horizon are left out of the result."""
     taken = list(busy)
     out: list[tuple[int, datetime]] = []
     ordered = sorted(papers, key=lambda p: (p.priority, p.added_at, p.id or 0))
     for paper in ordered:
         if paper.id is None:
             continue
-        duration = paper.duration_minutes or cfg.schedule.duration_minutes
+        duration = paper.duration_minutes or (
+            duration_of(paper) if duration_of else cfg.schedule.duration_minutes
+        )
         slot = next_free(cfg, taken, now, duration)
         if slot is None:
             continue

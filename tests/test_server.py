@@ -24,10 +24,11 @@ TEST_CLIENTS = ["testclient"]  # ...and client address
 
 
 class FakePaper:
-    def __init__(self, id: int, title: str = "A paper", pdf_path: str | None = None):
+    def __init__(self, id: int, title: str = "A paper", pdf_path: str | None = None, media_path: str | None = None):
         self.id = id
         self.title = title
         self.pdf_path = pdf_path
+        self.media_path = media_path
 
     def to_dict(self, tz=None):
         return {"id": self.id, "title": self.title, "has_pdf": bool(self.pdf_path)}
@@ -36,10 +37,11 @@ class FakePaper:
 class FakeQueue:
     """Just enough of PaperQueue for middleware and file-serving tests."""
 
-    def __init__(self, pdf_dir: Path | None = None):
+    def __init__(self, pdf_dir: Path | None = None, media_dir: Path | None = None):
         self.cfg = SimpleNamespace(
             server=SimpleNamespace(token=TOKEN, port=8765, extra_hosts=["papers.example.ts.net"]),
             pdf=SimpleNamespace(enabled=True, dir=str(pdf_dir) if pdf_dir else ""),
+            media=SimpleNamespace(dir=str(media_dir) if media_dir else ""),
             schedule=SimpleNamespace(timezone="UTC"),
         )
         self.papers: dict[int, FakePaper] = {}
@@ -317,6 +319,7 @@ def home(tmp_path, monkeypatch):
         '[library]\nprovider = "off"\n'
         '[calendar]\nbackend = "off"\n'
         f'[pdf]\nenabled = false\ndir = "{tmp_path / "pdfs"}"\n'
+        f'[media]\ndir = "{tmp_path / "Media"}"\n'
         '[schedule]\ntimezone = "Europe/Berlin"\n'
     )
     monkeypatch.setenv("PAPERQUEUE_HOME", str(h))
@@ -476,3 +479,106 @@ def test_library_and_calendar_sync_endpoints(c):
     assert r.status_code == 200 and "warnings" in r.json()
     r = c.post("/api/calendar/sync", json={}, headers=MUT)
     assert r.status_code == 200 and isinstance(r.json()["warnings"], list)
+
+
+# --------------------------------------------------------------------------- media serving
+
+
+def test_csp_allows_youtube_thumbnails_only():
+    csp = client_for(FakeQueue()).get("/").headers["content-security-policy"]
+    assert "img-src 'self' data: https://i.ytimg.com;" in csp
+    assert "media-src" not in csp  # falls back to default-src 'self'
+    assert csp.count("https://") == 1
+
+
+def media_queue(tmp_path):
+    media_dir = tmp_path / "Media"
+    media_dir.mkdir(parents=True)
+    audio = media_dir / "Talk [dQw4w9WgXcQ].m4a"
+    audio.write_bytes(bytes(range(256)) * 4)
+    video = media_dir / "Talk [abcdefghijk].mp4"
+    video.write_bytes(b"\0" * 64)
+    q = FakeQueue(media_dir=media_dir)
+    q.papers = {1: FakePaper(1, media_path=str(audio)), 2: FakePaper(2, media_path=str(video))}
+    return q, media_dir
+
+
+def test_media_supports_range_requests(tmp_path):
+    q, _ = media_queue(tmp_path)
+    c = client_for(q)
+    r = c.get("/api/papers/1/media")
+    assert r.status_code == 200 and len(r.content) == 1024
+    assert r.headers["content-type"] == "audio/mp4"
+    assert r.headers["accept-ranges"] == "bytes"
+    assert r.headers["content-disposition"].startswith("inline")
+    r = c.get("/api/papers/1/media", headers={"Range": "bytes=100-199"})
+    assert r.status_code == 206
+    assert r.headers["content-range"] == "bytes 100-199/1024"
+    assert r.content == (bytes(range(256)) * 4)[100:200]
+    assert c.get("/api/papers/2/media").headers["content-type"] == "video/mp4"
+
+
+def test_media_confinement_and_suffixes(tmp_path):
+    q, media_dir = media_queue(tmp_path)
+    secret = tmp_path / "secret.m4a"
+    secret.write_bytes(b"secret")
+    link = media_dir / "link.m4a"
+    link.symlink_to(secret)
+    for name in ("notes.txt", "clip.mkv", "page.html"):
+        (media_dir / name).write_text("secret")
+    q.papers = {
+        1: FakePaper(1, media_path=str(media_dir / ".." / "secret.m4a")),
+        2: FakePaper(2, media_path=str(secret)),
+        3: FakePaper(3, media_path=str(link)),
+        4: FakePaper(4, media_path=str(media_dir / "notes.txt")),
+        5: FakePaper(5, media_path=str(media_dir / "clip.mkv")),
+        6: FakePaper(6, media_path=str(media_dir / "page.html")),
+        7: FakePaper(7, media_path=None),
+        8: FakePaper(8, media_path=str(tmp_path / "MediaEvil" / "x.m4a")),
+        9: FakePaper(9, media_path=str(media_dir / "missing.m4a")),
+    }
+    c = client_for(q)
+    for pid in q.papers:
+        r = c.get(f"/api/papers/{pid}/media")
+        assert r.status_code == 404, pid
+        assert b"secret" not in r.content
+    assert c.get("/api/papers/42/media").status_code == 404
+    q, _ = media_queue(tmp_path / "unset")
+    q.cfg.media.dir = ""
+    assert client_for(q).get("/api/papers/1/media").status_code == 404
+
+
+def test_media_needs_token_from_other_devices(tmp_path):
+    q, _ = media_queue(tmp_path)
+    remote = client_for(q, local=False)
+    assert remote.get("/api/papers/1/media").status_code == 401
+    r = remote.get("/api/papers/1/media", headers={"Authorization": f"Bearer {TOKEN}", "Range": "bytes=0-9"})
+    assert r.status_code == 206 and len(r.content) == 10
+
+
+def test_youtube_add_and_set_media(c, ytdlp, kicks, monkeypatch):
+    VID = "dQw4w9WgXcQ"
+    r = c.post("/api/papers", json={"ref": f"https://youtu.be/{VID}", "media": "audio", "when": "none"}, headers=MUT)
+    assert r.status_code == 201, r.text
+    p = r.json()["paper"]
+    assert (p["kind"], p["video_id"], p["media_mode"], p["media_status"], p["has_media"]) == (
+        "video", VID, "audio", "pending", False)
+    assert p["duration_seconds"] == 2520 and "media_path" not in p and len(kicks) == 1
+    pid = p["id"]
+    assert c.post(f"/api/papers/{pid}/media", json={"mode": "link"}).status_code == 403  # no X-PaperQueue
+    r = c.post(f"/api/papers/{pid}/media", json={"mode": "link"}, headers=MUT)
+    assert r.status_code == 200 and r.json()["paper"]["media_mode"] == "link"
+    assert c.post(f"/api/papers/{pid}/media", json={"mode": "dvd"}, headers=MUT).status_code == 400
+    assert c.post("/api/papers/999/media", json={"mode": "audio"}, headers=MUT).status_code == 404
+
+    from paperqueue import metadata
+
+    monkeypatch.setattr(metadata, "find_tool", lambda name: None)
+    r = c.post(f"/api/papers/{pid}/media", json={"mode": "audio"}, headers=MUT)
+    body = r.json()
+    assert body["paper"]["media_error"] == "no_deno"
+    assert "brew install deno" in body["paper"]["media_fix"] and "brew install deno" in body["warnings"][0]
+    slots = c.get(f"/api/slots?n=2&paper_id={pid}").json()["slots"]
+    assert len(slots) == 2
+    st = c.get("/api/status").json()["media"]
+    assert st["deno"] is False and st["failed"][0]["error"] == "no_deno"

@@ -66,12 +66,28 @@ alert_minutes = 10
 enabled = true
 dir = "{pdf_dir}"
 
+[media]
+# YouTube videos: "link" (just the link), "audio" or "video" (a local copy, made by yt-dlp,
+# in `dir` for the iPhone Files app). Downloads need Deno; video also needs ffmpeg:
+#   brew install deno ffmpeg
+# Downloading is opt-in and your responsibility under YouTube's Terms of Service.
+default_mode = "link"
+dir = "{media_dir}"
+max_height = 480
+max_video_mb = 1500
+max_audio_mb = 300
+# If YouTube asks to confirm you are not a bot, read its cookies from a browser you are
+# signed in with: "safari", "chrome", "firefox", ... Empty = no cookies.
+cookies_from_browser = ""
+
 [schedule]
 # Reading slots used by "next free slot" and auto-scheduling.
 days = ["mon", "tue", "wed", "thu", "fri"]
 times = ["08:30"]
 duration_minutes = 45
 horizon_days = 14
+# Longest session booked for a video (sessions otherwise last as long as the video).
+max_session_minutes = 90
 # IANA timezone, e.g. "Europe/Berlin". Empty = system timezone.
 timezone = ""
 """
@@ -80,6 +96,8 @@ WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 PROVIDERS = ("off", "zotero", "mendeley")
 ZOTERO_SOURCES = ("local", "web")
 CALENDAR_BACKENDS = ("off", "apple")
+MEDIA_MODES = ("link", "audio", "video")
+COOKIE_BROWSERS = ("brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
@@ -140,11 +158,22 @@ class PdfConfig:
 
 
 @dataclass
+class MediaConfig:
+    default_mode: str = "link"
+    dir: Path = field(default_factory=lambda: (ICLOUD_PDF_DIR / "Media").expanduser())
+    max_height: int = 480
+    max_video_mb: int = 1500
+    max_audio_mb: int = 300
+    cookies_from_browser: str = ""
+
+
+@dataclass
 class ScheduleConfig:
     days: list[str] = field(default_factory=lambda: ["mon", "tue", "wed", "thu", "fri"])
     times: list[str] = field(default_factory=lambda: ["08:30"])
     duration_minutes: int = 45
     horizon_days: int = 14
+    max_session_minutes: int = 90
     timezone: str = ""
 
 
@@ -157,6 +186,7 @@ class Config:
     mendeley: MendeleyConfig = field(default_factory=MendeleyConfig)
     calendar: CalendarConfig = field(default_factory=CalendarConfig)
     pdf: PdfConfig = field(default_factory=PdfConfig)
+    media: MediaConfig = field(default_factory=MediaConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
     @property
@@ -174,6 +204,15 @@ class Config:
     @property
     def calendar_lock_path(self) -> Path:
         return self.home / "calendar.lock"
+
+    @property
+    def media_lock_path(self) -> Path:
+        return self.home / "media.lock"
+
+    @property
+    def media_tmp_dir(self) -> Path:
+        """Downloads land here first (outside iCloud Drive), then move into `media.dir`."""
+        return self.home / "media-tmp"
 
     @property
     def logs_dir(self) -> Path:
@@ -230,6 +269,16 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[calendar] apple_calendar must not be empty")
     if not 0 <= cfg.calendar.alert_minutes <= 24 * 60:
         raise ConfigError("[calendar] alert_minutes must be between 0 and 1440")
+    m = cfg.media
+    if m.default_mode not in MEDIA_MODES:
+        raise ConfigError(f"[media] default_mode must be one of {', '.join(MEDIA_MODES)}")
+    if not 144 <= m.max_height <= 4320:
+        raise ConfigError("[media] max_height must be between 144 and 4320")
+    if not 1 <= m.max_video_mb <= 100_000 or not 1 <= m.max_audio_mb <= 100_000:
+        raise ConfigError("[media] max_video_mb and max_audio_mb must be between 1 and 100000")
+    browser = re.split(r"[+:]", m.cookies_from_browser.strip(), maxsplit=1)[0].lower()
+    if m.cookies_from_browser.strip() and browser not in COOKIE_BROWSERS:
+        raise ConfigError(f"[media] cookies_from_browser must start with one of {', '.join(COOKIE_BROWSERS)}")
     s = cfg.schedule
     s.days = [d.strip().lower()[:3] for d in s.days]
     if not s.days or any(d not in WEEKDAYS for d in s.days):
@@ -240,6 +289,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[schedule] duration_minutes must be between 5 and 600")
     if not 1 <= s.horizon_days <= 365:
         raise ConfigError("[schedule] horizon_days must be between 1 and 365")
+    if not 5 <= s.max_session_minutes <= 600:
+        raise ConfigError("[schedule] max_session_minutes must be between 5 and 600")
     if s.timezone:
         try:
             ZoneInfo(s.timezone)
@@ -281,6 +332,7 @@ def load_config(home: Path | None = None) -> Config:
                 token=secrets.token_urlsafe(18),
                 backend="apple" if sys.platform == "darwin" else "off",
                 pdf_dir=str(ICLOUD_PDF_DIR),
+                media_dir=str(ICLOUD_PDF_DIR / "Media"),
             ),
         )
     text = path.read_text(encoding="utf-8")
@@ -290,7 +342,7 @@ def load_config(home: Path | None = None) -> Config:
         raise ConfigError(f"{path}: {exc}") from exc
 
     cfg = Config(home=home)
-    for name in ("server", "library", "zotero", "mendeley", "calendar", "pdf", "schedule"):
+    for name in ("server", "library", "zotero", "mendeley", "calendar", "pdf", "media", "schedule"):
         _apply(name, getattr(cfg, name), raw.get(name, {}))
 
     if not cfg.server.token:

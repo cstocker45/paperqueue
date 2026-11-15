@@ -19,13 +19,15 @@ except ImportError:  # pragma: no cover - mcp 1.x
     from mcp.server.fastmcp import FastMCP  # type: ignore[no-redef]
     from mcp.server.fastmcp.exceptions import ToolError  # type: ignore[no-redef]
 
+from .mediacache import fix_for, format_length
+
 log = logging.getLogger("paperqueue.mcp")
 
 INSTRUCTIONS = """\
-paperqueue is the user's personal reading queue for research papers. Papers added here are
-scheduled into reading sessions on their Apple Calendar (with an alert that reaches their Mac,
-iPhone and Watch), cached as PDFs for offline reading where possible, and mirrored to their
-reference manager (Zotero or Mendeley) when one is configured.
+paperqueue is the user's personal reading queue for research papers and YouTube videos.
+Items added here are scheduled into sessions on their Apple Calendar (with an alert that
+reaches their Mac, iPhone and Watch), papers are cached as PDFs for offline reading where
+possible and mirrored to their reference manager (Zotero or Mendeley) when one is configured.
 
 When to use it
 - The user expresses intent to read a paper ("add this", "save this for later", "I want to read X",
@@ -41,6 +43,18 @@ When to use it
 - When you recommend papers yourself (e.g. in a literature answer), offer once, in a single line,
   to add them to the reading queue. Do not repeat the offer, and do not add them unasked.
 
+YouTube videos
+- YouTube links (youtube.com/watch, youtu.be, /shorts/, /live/, /embed/) go in the same queue:
+  "watch this later", "add this talk" -> add_paper(ref=<link>). The session lasts as long as the
+  video (at most 90 minutes) and the calendar event reads "Watch: ...". Playlists are refused;
+  add the videos one at a time.
+- Keep the default (a link only). Pass media="audio" or media="video" only when the user asks
+  for offline use, audio or a download ("download it", "for the plane", "as a podcast").
+  Downloading is the user's choice and responsibility under YouTube's Terms of Service.
+- To change it later, call set_media(paper_id, "link" | "audio" | "video"); "link" deletes the
+  local file. Downloads run in the background: report media.status ("pending", "downloading",
+  "done", "failed"), and for "failed" pass on media.fix (a one-line fix) to the user.
+
 Reporting
 - After adding or scheduling, tell the user what was queued and when, using the `scheduled`
   field (already in the user's local time), e.g. "Queued 'Attention Is All You Need' for
@@ -49,7 +63,8 @@ Reporting
   (and when it is scheduled); do not try to add it again.
 
 Rules
-- Never mark papers read (mark_read) or remove them (remove_paper) unless the user asks.
+- Never mark papers read or videos watched (mark_read), remove them (remove_paper) or change
+  their media mode (set_media) unless the user asks.
 - Never reschedule existing sessions unless asked; auto_schedule is for explicit requests like
   "schedule my queue" or "move my missed papers".
 - For "what should I read today/this week?", call `upcoming` (it also lists missed sessions).
@@ -115,11 +130,25 @@ def paper_summary(paper: Any, tz: tzinfo, now: datetime | None = None, *, full: 
     start = _parse_dt(getattr(paper, "scheduled_start", None))
     duration = getattr(paper, "duration_minutes", None)
     status = getattr(paper, "status", "to_read")
-    d: dict[str, Any] = {
-        "id": paper.id,
-        "title": paper.title,
-        "authors": short_authors(getattr(paper, "authors", [])),
-    }
+    video = getattr(paper, "kind", "paper") == "video"
+    d: dict[str, Any] = {"id": paper.id, "title": paper.title}
+    if video:
+        d["kind"] = "video"
+        d["channel"] = ", ".join(getattr(paper, "authors", []) or [])
+        seconds = getattr(paper, "duration_seconds", None)
+        if seconds:
+            d["length"] = format_length(seconds)
+        media_status = getattr(paper, "media_status", None)
+        media: dict[str, Any] = {"mode": getattr(paper, "media_mode", "link")}
+        if media_status:
+            media["status"] = media_status
+        if error := getattr(paper, "media_error", None):
+            media |= {"error": error, "fix": fix_for(error)}
+        if media_status == "done" and getattr(paper, "media_path", None):
+            media["file"] = str(paper.media_path)
+        d["media"] = media
+    else:
+        d["authors"] = short_authors(getattr(paper, "authors", []))
     venue, year = getattr(paper, "venue", None), getattr(paper, "year", None)
     vy = " ".join(str(x) for x in (venue, year) if x)
     if vy:
@@ -228,13 +257,16 @@ def build_server(queue: Any = None) -> FastMCP:
         notes: str = "",
         when: str = "next",
         title: str | None = None,
+        media: str | None = None,
     ) -> dict:
-        """Add a paper to the reading queue and (by default) schedule it in the next free reading slot.
+        """Add a paper or YouTube video to the reading queue and (by default) schedule it in the
+        next free slot.
 
-        ref: arXiv ID, DOI, URL (preferred) or title. priority: "high" | "normal" | "low".
+        ref: arXiv ID, DOI, URL (preferred), YouTube link or title. priority: "high" | "normal" | "low".
         tags: short topic tags. when: "next" (default) | "today" | "tomorrow" | weekday | "YYYY-MM-DD" |
         ISO datetime in local time | "none". title: optional title (used if metadata lookup fails).
-        Deduplicates: returns status "already_queued" for papers already in the queue."""
+        media (YouTube only): omit for a link; "audio" or "video" only when the user asks for a
+        download / offline copy. Deduplicates: returns status "already_queued" for items already queued."""
         res = call(
             q().add,
             ref,
@@ -244,6 +276,7 @@ def build_server(queue: Any = None) -> FastMCP:
             notes=notes or "",
             when=when,
             source="agent",
+            media=media,
         )
         paper = res.paper
         _cache_pdfs_soon()
@@ -319,8 +352,8 @@ def build_server(queue: Any = None) -> FastMCP:
 
     @mcp.tool()
     def mark_read(paper_id: int, notes: str | None = None) -> dict:
-        """Mark a paper as read (only when the user says they have read it). Optional notes are
-        appended to the paper's notes."""
+        """Mark a paper as read, or a video as watched (only when the user says so). Deletes a
+        downloaded video file. Optional notes are appended to the item's notes."""
         warnings: list[str] = []
         if notes:
             current = call(q().get, paper_id)
@@ -342,6 +375,14 @@ def build_server(queue: Any = None) -> FastMCP:
         (replaces) or title."""
         paper = call(q().update, paper_id, title=title, priority=priority, tags=tags, notes=notes)
         return {"paper": summ(paper), "warnings": []}
+
+    @mcp.tool()
+    def set_media(paper_id: int, mode: str) -> dict:
+        """Choose how a YouTube item is kept: "link" (no download; deletes a local file),
+        "audio" or "video" (downloaded in the background into iCloud Drive for offline use).
+        Only on the user's request. Calling it again with the same mode retries a failed download."""
+        res = call(q().set_media, paper_id, mode)
+        return {"paper": summ(res.paper), "warnings": list(res.warnings)}
 
     @mcp.tool()
     def remove_paper(paper_id: int) -> dict:

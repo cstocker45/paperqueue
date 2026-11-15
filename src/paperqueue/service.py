@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -18,10 +19,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from . import pdfcache, scheduler
-from .config import Config
+from . import mediacache, pdfcache, scheduler
+from .config import MEDIA_MODES, Config
 from .db import Paper, Store, to_iso
-from .metadata import MetadataError, PaperMeta, Ref, Resolver, http_url, parse_ref
+from .metadata import MetadataError, PaperMeta, Ref, Resolver, http_url, parse_ref, watch_url
 from .types import (
     AddResult,
     BatchResult,
@@ -38,6 +39,8 @@ log = logging.getLogger(__name__)
 PRIORITIES = {"high": 1, "normal": 2, "low": 3}
 VIEWS = ("queue", "upcoming", "missed", "read", "all")
 LIBRARY_SOURCES = ("zotero", "mendeley")
+# Metadata sources that leave a record incomplete, so maintain() retries the lookup.
+INCOMPLETE_SOURCES = ("hints", "minimal", "oembed")
 TITLE_MAX = 90
 ABSTRACT_EXCERPT = 500
 CHECK_TTL = timedelta(minutes=5)
@@ -76,6 +79,27 @@ def clean_tags(tags: Iterable[str]) -> list[str]:
     return out
 
 
+def parse_media(value: str) -> str:
+    """ "link" | "audio" | "video" (case-insensitive)."""
+    mode = str(value).strip().lower()
+    if mode not in MEDIA_MODES:
+        raise ValueError(f"invalid media mode {value!r}; use link, audio or video")
+    return mode
+
+
+def _media_state(mode: str) -> dict[str, Any]:
+    """Columns for a video entering `mode` with no file yet."""
+    return {
+        "media_mode": mode,
+        "media_path": None,
+        "media_error": None,
+        "media_status": None if mode == "link" else "pending",
+    }
+
+
+_NO_MEDIA: dict[str, Any] = {"media_path": None, "media_status": None, "media_error": None}
+
+
 def _merge_tags(old: list[str], new: list[str]) -> list[str]:
     return clean_tags([*old, *new])
 
@@ -93,7 +117,11 @@ def _shorten(text: str, limit: int) -> str:
 
 
 def event_title(paper: Paper) -> str:
-    return _shorten(f"Read: {paper.title}", TITLE_MAX)
+    if paper.kind == "video":
+        verb = "Listen" if paper.media_mode == "audio" else "Watch"
+    else:
+        verb = "Read"
+    return _shorten(f"{verb}: {paper.title}", TITLE_MAX)
 
 
 def event_notes(paper: Paper) -> str:
@@ -101,18 +129,21 @@ def event_notes(paper: Paper) -> str:
     lines: list[str] = []
     if paper.authors:
         lines.append(", ".join(paper.authors[:6]) + (" et al." if len(paper.authors) > 6 else ""))
-    venue_year = " · ".join(x for x in (paper.venue, str(paper.year) if paper.year else None) if x)
+    length = mediacache.format_length(paper.duration_seconds) if paper.duration_seconds else None
+    venue_year = " · ".join(x for x in (paper.venue, str(paper.year) if paper.year else None, length) if x)
     if venue_year:
         lines.append(venue_year)
     links = []
     if paper.url:
-        links.append(f"Paper: {paper.url}")
+        links.append(f"{'YouTube' if paper.kind == 'video' else 'Paper'}: {paper.url}")
     if paper.pdf_url and paper.pdf_url != paper.url:
         links.append(f"PDF: {paper.pdf_url}")
     if paper.doi and f"doi.org/{paper.doi}" not in (paper.url or ""):
         links.append(f"DOI: https://doi.org/{paper.doi}")
     if paper.pdf_path:
         links.append(f"Offline PDF (Files app): {Path(paper.pdf_path).name}")
+    if paper.media_path and paper.media_status == "done":
+        links.append(f"Offline {paper.media_mode} (Files app): {Path(paper.media_path).name}")
     if links:
         lines += ["", *links]
     if paper.abstract:
@@ -150,6 +181,14 @@ def spec_hash(spec: EventSpec) -> str:
     return hashlib.sha256(json.dumps(content, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
+def _shown(path: Path) -> str:
+    """`path` with the home directory as ~, for display."""
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        return str(path)
+
+
 def _wants_event(paper: Paper) -> bool:
     return paper.status == "to_read" and paper.end is not None
 
@@ -169,6 +208,9 @@ def _paper_from_meta(meta: PaperMeta, **fields: Any) -> Paper:
         pdf_url=http_url(meta.pdf_url),
         doi=meta.doi,
         arxiv_id=meta.arxiv_id,
+        kind="video" if meta.video_id else "paper",
+        video_id=meta.video_id,
+        duration_seconds=meta.duration_seconds,
         **fields,
     )
 
@@ -190,8 +232,10 @@ def _meta_of(paper: Paper) -> PaperMeta:
 def _minimal_meta(ref: Ref, title: str | None, pdf_url: str | None) -> PaperMeta | None:
     """A placeholder record when lookups fail but a URL (or identifier) or a title is known.
     `pdf_url` is the URL the resolver found to be a PDF, if any."""
-    doi = arxiv_id = url = None
-    if ref.kind == "doi":
+    doi = arxiv_id = url = video_id = None
+    if ref.kind == "youtube":
+        video_id, url = ref.value, watch_url(ref.value)
+    elif ref.kind == "doi":
         doi, url = ref.value, f"https://doi.org/{ref.value}"
     elif ref.kind == "arxiv":
         arxiv_id = ref.value
@@ -212,6 +256,7 @@ def _minimal_meta(ref: Ref, title: str | None, pdf_url: str | None) -> PaperMeta
         pdf_url=pdf_url,
         doi=doi,
         arxiv_id=arxiv_id,
+        video_id=video_id,
         matched_by="minimal",
     )
 
@@ -307,9 +352,7 @@ class PaperQueue:
                 busy.append((start, end))
         return busy
 
-    def _duration(self, value: int | None) -> int:
-        if value is None:
-            return self.cfg.schedule.duration_minutes
+    def _duration(self, value: int) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or not 5 <= value <= 600:
             raise ValueError("duration_minutes must be an integer between 5 and 600")
         return value
@@ -325,11 +368,11 @@ class PaperQueue:
     def _meta_changes(self, paper: Paper, meta: PaperMeta) -> dict[str, Any]:
         """Fields to fill in on `paper` from freshly resolved metadata."""
         changes: dict[str, Any] = {}
-        if paper.needs_metadata and meta.matched_by not in ("hints", "minimal"):
+        if paper.needs_metadata and meta.matched_by not in INCOMPLETE_SOURCES:
             changes["needs_metadata"] = False
             if meta.title and meta.title != paper.title:
                 changes["title"] = meta.title.strip()[:500]
-        for name in ("authors", "year", "venue", "abstract"):
+        for name in ("authors", "year", "venue", "abstract", "duration_seconds"):
             value = getattr(meta, name)
             if value and not getattr(paper, name):
                 changes[name] = value
@@ -347,6 +390,8 @@ class PaperQueue:
 
     def _find_ref(self, ref: Ref) -> Paper | None:
         """Duplicate check that needs no network."""
+        if ref.kind == "youtube":
+            return self.store.find_duplicate(video_id=ref.value)
         if ref.kind == "arxiv":
             return self.store.find_duplicate(arxiv_id=ref.value)
         if ref.kind == "doi":
@@ -356,6 +401,30 @@ class PaperQueue:
         if ref.kind == "text":
             return self.store.find_duplicate(title=ref.value)
         return None
+
+    def _default_duration(self, paper: Paper) -> int:
+        """Session minutes when none is set: a video's length rounded up to 5 minutes and capped
+        at schedule.max_session_minutes, else the configured reading-session length."""
+        s = self.cfg.schedule
+        if paper.kind == "video" and paper.duration_seconds:
+            minutes = math.ceil(paper.duration_seconds / 300) * 5
+            return max(5, min(minutes, s.max_session_minutes))
+        return s.duration_minutes
+
+    def _switch_media(self, paper: Paper, mode: str) -> bool:
+        """Put a video into `mode`, deleting a file made for another mode. A failed download
+        is reset. Returns whether the media worker should be started."""
+        assert paper.id is not None
+        if mode == paper.media_mode and (
+            mode == "link" or paper.media_status in ("pending", "downloading", "done")
+        ):
+            return paper.media_status == "pending"
+        mediacache.discard(paper)
+        changes = _media_state(mode)
+        if code := mediacache.preflight(mode):
+            changes |= {"media_status": "failed", "media_error": code}
+        self.store.update(paper.id, **changes)
+        return changes["media_status"] == "pending"
 
     def _finish(self, ids: Iterable[int]) -> builtins.list[str]:
         """After a mutation: reconcile the affected events and bump the revision."""
@@ -385,11 +454,17 @@ class PaperQueue:
             return self.store.list(status="all", query=query, tag=tag, order="added")
         raise ValueError(f"unknown view {view!r}; use one of {', '.join(VIEWS)}")
 
-    def free_slots(self, n: int = 5) -> builtins.list[datetime]:
+    def free_slots(self, n: int = 5, paper_id: int | None = None) -> builtins.list[datetime]:
+        """The next `n` free slots, long enough for `paper_id`'s session when given."""
         if isinstance(n, bool) or not isinstance(n, int) or n < 0:
             raise ValueError("n must be a non-negative integer")
-        duration = self.cfg.schedule.duration_minutes
-        busy = self._busy()
+        if paper_id is None:
+            duration = self.cfg.schedule.duration_minutes
+            busy = self._busy()
+        else:
+            paper = self._active(paper_id)
+            duration = paper.duration_minutes or self._default_duration(paper)
+            busy = self._busy([paper_id])
         after = self._now()
         out: builtins.list[datetime] = []
         for _ in range(min(n, 100)):
@@ -413,8 +488,12 @@ class PaperQueue:
         notes: str = "",
         when: str | None = None,
         source: str = "manual",
+        media: str | None = None,
     ) -> AddResult:
+        """Add a paper or a YouTube video. `media` ("link" | "audio" | "video", videos only)
+        overrides media.default_mode; audio and video are downloaded in the background."""
         prio = parse_priority(priority)
+        mode = parse_media(media) if media is not None else None
         tag_list = clean_tags(tags)
         notes = (notes or "").strip()
         hint_map: dict[str, Any] = dict(hints or {})
@@ -425,6 +504,8 @@ class PaperQueue:
         if not ref:
             raise ValueError("nothing to add: give an arXiv ID, DOI, URL or title")
         parsed = parse_ref(ref)
+        if mode not in (None, "link") and parsed.kind != "youtube":
+            raise ValueError("audio and video downloads are for YouTube links only")
         warnings: builtins.list[str] = []
 
         existing = self._find_ref(parsed)
@@ -443,6 +524,7 @@ class PaperQueue:
 
         with self.store.transaction():
             dup = existing or self.store.find_duplicate(
+                video_id=meta.video_id if meta else None,
                 doi=meta.doi if meta else None,
                 arxiv_id=meta.arxiv_id if meta else None,
                 url=meta.url if meta else None,
@@ -457,21 +539,31 @@ class PaperQueue:
                         priority=prio,
                         notes=notes,
                         source=source,
-                        needs_metadata=meta.matched_by in ("hints", "minimal"),
+                        needs_metadata=meta.matched_by in INCOMPLETE_SOURCES,
                     )
                 )
                 created = True
             else:
                 paper, created = self._merge_duplicate(dup, meta, prio, tag_list, notes, warnings)
+            target = mode or (self.cfg.media.default_mode if created else None)
+            start_worker = (
+                paper.kind == "video" and target is not None and self._switch_media(paper, target)
+            )
         paper_id = paper.id
         assert paper_id is not None
+        paper = self._active(paper_id)
 
         if when is not None:
             paper = self._schedule_on_add(paper, when, warnings)
-        if dup is None and source not in LIBRARY_SOURCES:
+        if dup is None and source not in LIBRARY_SOURCES and paper.kind == "paper":
             warnings += self._push(paper)[1]
         warnings += self._finish([paper_id])
-        return AddResult(paper=self._active(paper_id), created=created, warnings=warnings)
+        paper = self._active(paper_id)
+        if paper.media_status == "failed":
+            warnings.append(f"not downloaded: {mediacache.fix_for(paper.media_error)}")
+        if start_worker:
+            mediacache.kick(self.cfg)
+        return AddResult(paper=paper, created=created, warnings=warnings)
 
     def _merge_duplicate(
         self,
@@ -487,7 +579,7 @@ class PaperQueue:
         created = False
         if dup.status == "removed":
             changes |= {"status": "to_read", "read_at": None, "scheduled_start": None,
-                        "duration_minutes": None, "priority": prio}
+                        "duration_minutes": None, "priority": prio, **_NO_MEDIA, "media_mode": "link"}
             created = True
         elif prio != 2 and prio != dup.priority:
             changes["priority"] = prio
@@ -509,23 +601,20 @@ class PaperQueue:
         is_next = when.strip().lower() in ("next", "")
         if paper.scheduled_start and is_next:
             return paper
+        duration = paper.duration_minutes or self._default_duration(paper)
         try:
-            start = scheduler.parse_when(when, self.cfg, self._busy([paper.id]), self._now())
+            start = scheduler.parse_when(when, self.cfg, self._busy([paper.id]), self._now(), duration)
         except ValueError as exc:
             warnings.append(f"not scheduled: {exc}")
             return paper
         if start is None:
             return paper
-        return self.store.update(
-            paper.id,
-            scheduled_start=to_iso(start),
-            duration_minutes=paper.duration_minutes or self.cfg.schedule.duration_minutes,
-        )
+        return self.store.update(paper.id, scheduled_start=to_iso(start), duration_minutes=duration)
 
     def _push(self, paper: Paper) -> tuple[bool, builtins.list[str]]:
         """Create the paper in the reference manager, if configured to. Returns (pushed, warnings)."""
         provider = self.library
-        if provider is None or paper.library_key or not self._push_enabled(provider):
+        if provider is None or paper.library_key or paper.kind != "paper" or not self._push_enabled(provider):
             return False, []
         assert paper.id is not None
         try:
@@ -579,13 +668,15 @@ class PaperQueue:
         paper = self._active(id)
         if paper.status != "to_read":
             raise ValueError(f"paper #{id} is already read; mark it unread to schedule it")
-        duration = self._duration(duration_minutes or paper.duration_minutes)
+        duration = self._duration(
+            duration_minutes or paper.duration_minutes or self._default_duration(paper)
+        )
         now = self._now()
         busy = self._busy([id])
         if isinstance(when, datetime):
             start: datetime | None = (when if when.tzinfo else when.replace(tzinfo=self.tz)).astimezone(UTC)
         else:
-            start = scheduler.parse_when(when, self.cfg, busy, now)
+            start = scheduler.parse_when(when, self.cfg, busy, now, duration)
         if start is None:
             return self.unschedule(id)
         warnings: builtins.list[str] = []
@@ -615,8 +706,11 @@ class PaperQueue:
         ids = {p.id for p in candidates if p.id is not None}
         by_id = {p.id: p for p in candidates}
         placed: builtins.list[Paper] = []
-        for paper_id, start in scheduler.plan(candidates, self.cfg, self._busy(ids), now):
-            duration = by_id[paper_id].duration_minutes or self.cfg.schedule.duration_minutes
+        planned = scheduler.plan(
+            candidates, self.cfg, self._busy(ids), now, duration_of=self._default_duration
+        )
+        for paper_id, start in planned:
+            duration = by_id[paper_id].duration_minutes or self._default_duration(by_id[paper_id])
             placed.append(
                 self.store.update(paper_id, scheduled_start=to_iso(start), duration_minutes=duration)
             )
@@ -641,18 +735,69 @@ class PaperQueue:
                 changes |= {"scheduled_start": None, "duration_minutes": None}
             if moved := pdfcache.retire(paper, self.cfg):
                 changes["pdf_path"] = str(moved)
+            if paper.kind == "video":
+                mediacache.discard(paper)
+                changes |= _NO_MEDIA
         elif not read and paper.status == "read":
             changes = {"status": "to_read", "read_at": None}
+            if paper.kind == "video":
+                changes |= _media_state(paper.media_mode)
         if changes:
             self.store.update(id, **changes)
         warnings = self._finish([id])
+        if changes.get("media_status") == "pending":
+            mediacache.kick(self.cfg)
         return OpResult(paper=self._active(id), warnings=warnings)
+
+    def set_media(self, id: int, mode: str) -> OpResult:
+        """Switch a video between "link", "audio" and "video". Audio and video start a
+        background download; the file of the previous mode is deleted. Choosing the same
+        mode again retries a failed download."""
+        paper = self._active(id)
+        mode = parse_media(mode)
+        if paper.kind != "video":
+            raise ValueError(f"#{id} is not a video; media modes are for YouTube items")
+        if paper.status != "to_read":
+            raise ValueError(f"#{id} is already watched; mark it unwatched first")
+        start_worker = self._switch_media(paper, mode)
+        warnings = self._finish([id])
+        paper = self._active(id)
+        if paper.media_status == "failed":
+            warnings.append(f"not downloaded: {mediacache.fix_for(paper.media_error)}")
+        if start_worker:
+            mediacache.kick(self.cfg)
+        return OpResult(paper=paper, warnings=warnings)
+
+    def media_result(
+        self, id: int, mode: str, status: str, *, path: Path | None = None, error: str | None = None
+    ) -> bool:
+        """Record the media worker's progress for `id` in `mode`. A result for an item that has
+        since changed mode, been watched or removed is dropped (and its file deleted).
+        Returns whether it was recorded."""
+        with self.store.transaction():
+            paper = self.store.get(id)
+            current = paper is not None and paper.status == "to_read" and paper.media_mode == mode
+            if current:
+                changes: dict[str, Any] = {"media_status": status, "media_error": error}
+                if path is not None:
+                    changes["media_path"] = str(path)
+                self.store.update(id, **changes)
+        if not current:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            return False
+        for warning in self._finish([id]):
+            log.warning("%s", warning)
+        return True
 
     def remove(self, id: int) -> OpResult:
         paper = self._active(id)
         changes: dict[str, Any] = {"status": "removed", "scheduled_start": None, "duration_minutes": None}
         if moved := pdfcache.retire(paper, self.cfg):
             changes["pdf_path"] = str(moved)
+        if paper.kind == "video":
+            mediacache.discard(paper)
+            changes |= _NO_MEDIA
         removed = self.store.update(id, **changes)
         warnings = self._finish([id])
         return OpResult(paper=removed, warnings=warnings)
@@ -715,7 +860,7 @@ class PaperQueue:
 
         if self._push_enabled(provider):
             for paper in self.store.list(status="to_read"):
-                if paper.library_key is None and paper.source not in LIBRARY_SOURCES:
+                if paper.library_key is None and paper.source not in LIBRARY_SOURCES and paper.kind == "paper":
                     pushed, push_warnings = self._push(paper)
                     result.warnings += push_warnings
                     if pushed:
@@ -845,6 +990,7 @@ class PaperQueue:
             ("library", self.sync_library),
             ("metadata", self._retry_metadata),
             ("pdf cache", self.cache_pdfs),
+            ("media", self.kick_media),
         ]
         for name, step in steps:
             if name == "calendar" and self.calendar is None:
@@ -877,6 +1023,12 @@ class PaperQueue:
                 self.store.update(paper.id, pdf_path=str(path))
                 cached.append(paper.id)
         return self._finish(cached) if cached else []
+
+    def kick_media(self) -> builtins.list[str]:
+        """Start the media worker if a download is due (pending, or a failure due for a retry)."""
+        if any(mediacache.is_due(p) for p in self.store.list_media_pending()):
+            mediacache.kick(self.cfg)
+        return []
 
     def _retry_metadata(self) -> builtins.list[str]:
         now = self._now()
@@ -926,12 +1078,8 @@ class PaperQueue:
         lib_ok, lib_msg = self._check("library")
         cal_ok, cal_msg = self._check("calendar")
         provider = self.library
-        pdf_dir = self.cfg.pdf.dir
-        try:
-            shown_dir = f"~/{pdf_dir.relative_to(Path.home())}"
-        except ValueError:
-            shown_dir = str(pdf_dir)
         s = self.cfg.schedule
+        pending = self.store.list_media_pending()
         return {
             "rev": self.store.rev(),
             "counts": self.store.counts(self._now()),
@@ -948,11 +1096,24 @@ class PaperQueue:
                 "ok": cal_ok,
                 "message": cal_msg,
             },
-            "pdf": {"enabled": self.cfg.pdf.enabled, "dir": shown_dir},
+            "pdf": {"enabled": self.cfg.pdf.enabled, "dir": _shown(self.cfg.pdf.dir)},
+            "media": {
+                "default_mode": self.cfg.media.default_mode,
+                "dir": _shown(self.cfg.media.dir),
+                **mediacache.tools(),
+                "pending": sum(p.media_status != "failed" for p in pending),
+                "failed": [
+                    {"id": p.id, "title": p.title, "error": p.media_error,
+                     "fix": mediacache.fix_for(p.media_error)}
+                    for p in pending
+                    if p.media_status == "failed"
+                ],
+            },
             "schedule": {
                 "days": list(s.days),
                 "times": list(s.times),
                 "duration_minutes": s.duration_minutes,
+                "max_session_minutes": s.max_session_minutes,
                 "timezone": self.tz.key,
             },
             "lan": {"enabled": bool(self.lan_urls), "urls": list(self.lan_urls)},

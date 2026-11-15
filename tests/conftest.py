@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from paperqueue import metadata
+from paperqueue import mediacache, metadata
 from paperqueue.config import Config, load_config
 from paperqueue.metadata import PaperMeta, Resolver
 from paperqueue.service import PaperQueue
@@ -41,6 +42,91 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
             return [_FAKE_DNS.get(host, "93.184.216.34")]
 
     monkeypatch.setattr(metadata, "_host_addresses", fake_addresses)
+
+
+@pytest.fixture(autouse=True)
+def kicks(monkeypatch: pytest.MonkeyPatch) -> list[Config]:
+    """Never start a real media worker; record the attempts instead."""
+    calls: list[Config] = []
+
+    def fake_kick(cfg: Config) -> bool:
+        calls.append(cfg)
+        return True
+
+    monkeypatch.setattr(mediacache, "kick", fake_kick)
+    return calls
+
+
+@pytest.fixture(autouse=True)
+def _no_ytdlp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """yt-dlp is never run for real, and Deno/ffmpeg look absent whatever this machine has.
+    Tests that need them use the `ytdlp` fixture."""
+
+    def refuse(args: list[str], timeout: float, pass_fds: tuple[int, ...] = ()) -> Any:
+        raise AssertionError(f"unexpected yt-dlp call: {args}")
+
+    monkeypatch.setattr(metadata, "run_ytdlp", refuse)
+    monkeypatch.setattr(metadata, "find_tool", lambda name: None)
+
+
+VIDEO_ID = "dQw4w9WgXcQ"
+
+
+def ytdlp_info(video_id: str = VIDEO_ID, **extra: Any) -> dict[str, Any]:
+    info = {
+        "id": video_id,
+        "title": "How Transformers Work",
+        "channel": "Some Channel",
+        "uploader": "someone",
+        "upload_date": "20240115",
+        "duration": 2520,
+        "description": "A talk about attention. " * 100,
+    }
+    info.update(extra)
+    return info
+
+
+@dataclass
+class FakeYtDlp:
+    """Stands in for `metadata.run_ytdlp`: answers -J probes from `info`, and for downloads
+    writes `<id>.<ext>` into the -P directory (or runs `on_download`)."""
+
+    info: dict[str, dict[str, Any]] = field(default_factory=dict)
+    calls: list[list[str]] = field(default_factory=list)
+    fds: list[tuple[int, ...]] = field(default_factory=list)
+    ext: str = "m4a"
+    size: int = 1000
+    returncode: int = 0
+    output: str = ""
+    on_download: Callable[[list[str], Path], None] | None = None
+
+    def __call__(self, args: list[str], timeout: float, pass_fds: tuple[int, ...] = ()) -> Any:
+        self.calls.append(args)
+        self.fds.append(pass_fds)
+        video_id = args[-1].rsplit("=", 1)[-1]
+        if "-J" in args:
+            if video_id in self.info:
+                return subprocess.CompletedProcess(args, 0, json.dumps(self.info[video_id]), "")
+            return subprocess.CompletedProcess(args, 1, "", f"ERROR: [youtube] {video_id}: Video unavailable")
+        tmp = Path(args[args.index("-P") + 1])
+        if self.on_download:
+            self.on_download(args, tmp)
+        elif self.returncode == 0:
+            (tmp / f"{video_id}.{self.ext}").write_bytes(b"\0" * self.size)
+        return subprocess.CompletedProcess(args, self.returncode, "", self.output)
+
+    @property
+    def downloads(self) -> list[list[str]]:
+        return [c for c in self.calls if "-J" not in c]
+
+
+@pytest.fixture
+def ytdlp(monkeypatch: pytest.MonkeyPatch) -> FakeYtDlp:
+    """A fake yt-dlp with Deno and ffmpeg "installed"."""
+    fake = FakeYtDlp(info={VIDEO_ID: ytdlp_info()})
+    monkeypatch.setattr(metadata, "run_ytdlp", fake)
+    monkeypatch.setattr(metadata, "find_tool", lambda name: f"/opt/homebrew/bin/{name}")
+    return fake
 
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -94,6 +180,7 @@ def cfg(tmp_path: Path) -> Config:
     c.calendar.backend = "off"
     c.library.provider = "off"
     c.pdf.dir = tmp_path / "pdfs"
+    c.media.dir = tmp_path / "Media"
     c.schedule.timezone = "Europe/Berlin"
     return c
 

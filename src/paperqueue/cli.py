@@ -21,6 +21,7 @@ SERVICE_LABEL = "io.github.paperqueue"
 MCP_ADD_HINT = "claude mcp add -s user paperqueue -- paperqueue mcp"
 SECRET_KEYS = ("api_key", "client_secret", "token", "access_token", "refresh_token")
 MAINTENANCE_INTERVAL = 300  # seconds
+YTDLP_MAX_AGE_DAYS = 60
 
 
 # --- helpers -----------------------------------------------------------------
@@ -52,7 +53,10 @@ def _print_warnings(warnings) -> None:
 
 def _paper_line(s: dict) -> str:
     parts = [f"#{s['id']:<4}", s["title"]]
-    meta = " ".join(x for x in (s.get("authors"), f"({s['venue_year']})" if s.get("venue_year") else "") if x)
+    if s.get("kind") == "video":
+        meta = " · ".join(x for x in ("YouTube", s.get("length"), s.get("channel")) if x)
+    else:
+        meta = " ".join(x for x in (s.get("authors"), f"({s['venue_year']})" if s.get("venue_year") else "") if x)
     line = "  ".join(parts)
     if meta:
         line += f"\n       {meta}"
@@ -61,8 +65,11 @@ def _paper_line(s: dict) -> str:
         extra.append(f"priority {s['priority']}")
     if s.get("tags"):
         extra.append(" ".join(f"#{t}" for t in s["tags"]))
+    media = s.get("media") or {}
+    if media.get("mode", "link") != "link":
+        extra.append(f"{media['mode']} {media.get('status') or ''}".strip())
     if s.get("status") == "read":
-        extra.append("read")
+        extra.append("watched" if s.get("kind") == "video" else "read")
     elif s.get("scheduled"):
         extra.append(("MISSED " if s.get("missed") else "") + s["scheduled"])
     elif s.get("status") == "to_read":
@@ -174,8 +181,35 @@ def cmd_add(args) -> int:
         notes=args.notes or "",
         when=args.when,
         source="manual",
+        media=args.media,
     )
     _print_paper_result("Added" if res.created else "Already queued:", res.paper, res.warnings, queue)
+    return 0
+
+
+def cmd_media(args) -> int:
+    queue = make_queue()
+    res = queue.set_media(args.id, args.mode)
+    if args.mode == "link":
+        verb = "Link only:"
+    elif res.paper.media_status == "failed":
+        verb = f"Could not download {args.mode}:"
+    else:
+        verb = f"Downloading {args.mode} in the background:"
+    _print_paper_result(verb, res.paper, res.warnings, queue)
+    return 0
+
+
+def cmd_media_worker() -> int:
+    """Hidden: the detached downloader started by `mediacache.kick`."""
+    import logging
+
+    from . import mediacache
+
+    logging.basicConfig(
+        stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
+    mediacache.worker(make_queue())
     return 0
 
 
@@ -292,12 +326,49 @@ def cmd_sync(args) -> int:
     return 0
 
 
-def _check(ok: bool, label: str, detail: str = "", fix: str = "") -> bool:
-    print(f"[{'ok' if ok else 'FAIL'}] {label}" + (f": {detail}" if detail else ""))
+def _check(ok: bool, label: str, detail: str = "", fix: str = "", *, level: str = "FAIL") -> bool:
+    """Print one doctor line. `level="warn"` reports a problem that does not fail the run."""
+    print(f"[{'ok' if ok else level}] {label}" + (f": {detail}" if detail else ""))
     if not ok and fix:
         for line in fix.splitlines():
             print(f"       fix: {line}")
-    return ok
+    return ok or level == "warn"
+
+
+def _youtube_checks(cfg) -> list[bool]:
+    """yt-dlp freshness, Deno and ffmpeg, and failed downloads. Missing tools only fail the
+    run when the configured default media mode needs them."""
+    from .db import Store
+    from .mediacache import fix_for
+    from .metadata import find_tool
+
+    results: list[bool] = []
+    try:
+        from yt_dlp.version import __version__ as ytdlp_version  # type: ignore[import-untyped]
+
+        year, month, day = (int(x) for x in ytdlp_version.split(".")[:3])
+        released = datetime(year, month, day)
+        age = (datetime.now() - released).days
+        results.append(_check(
+            age <= YTDLP_MAX_AGE_DAYS, "yt-dlp", f"{ytdlp_version} ({age} days old)",
+            "YouTube changes often and old versions break: uv tool upgrade paperqueue", level="warn",
+        ))
+    except (ImportError, ValueError, TypeError) as exc:
+        results.append(_check(False, "yt-dlp", f"not usable: {exc}",
+                              "reinstall: uv tool install --reinstall paperqueue"))
+    mode = cfg.media.default_mode
+    for tool, needed, purpose in (
+        ("deno", mode != "link", "needed for YouTube audio/video downloads"),
+        ("ffmpeg", mode == "video", "needed for video downloads; audio works without it"),
+    ):
+        path = find_tool(tool)
+        results.append(_check(path is not None, tool, path or purpose, f"brew install {tool}",
+                              level="FAIL" if needed else "warn"))
+    for paper in Store(cfg.db_path).list_media_pending():
+        if paper.media_status == "failed":
+            results.append(_check(False, f"Download #{paper.id}", f"{paper.title} ({paper.media_error})",
+                                  fix_for(paper.media_error) or "", level="warn"))
+    return results
 
 
 def cmd_doctor(args) -> int:
@@ -374,6 +445,8 @@ def cmd_doctor(args) -> int:
                                   "(or set [pdf] dir / enabled = false in the config)"))
     else:
         _check(True, "PDF folder", "disabled")
+
+    results += _youtube_checks(cfg)
 
     registered = _mcp_registered()
     if registered:
@@ -506,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-maintenance", action="store_true", help="don't run background calendar/library sync")
     s.set_defaults(func=cmd_serve)
 
-    s = sub.add_parser("add", help="add a paper (arXiv ID, DOI, URL or title)")
+    s = sub.add_parser("add", help="add a paper (arXiv ID, DOI, URL or title) or a YouTube link")
     s.add_argument("ref")
     s.add_argument("--title", help="title to use if metadata can't be fetched")
     s.add_argument("-p", "--priority", default="normal", choices=["high", "normal", "low"])
@@ -514,7 +587,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-n", "--notes", default="")
     s.add_argument("-w", "--when", default="next",
                    help="next (default), today, tomorrow, a weekday, YYYY-MM-DD, ISO datetime, or none")
+    s.add_argument("-m", "--media", choices=["link", "audio", "video"],
+                   help="YouTube only: keep a link (default) or download audio/video for offline use")
     s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("media", help="YouTube: keep as link, or download audio/video")
+    s.add_argument("id", type=int)
+    s.add_argument("mode", choices=["link", "audio", "video"])
+    s.set_defaults(func=cmd_media)
 
     s = sub.add_parser("list", help="list papers")
     s.add_argument("view", nargs="?", default="queue", choices=["queue", "upcoming", "missed", "read", "all"])
@@ -539,7 +619,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int)
     s.set_defaults(func=cmd_auto_schedule)
 
-    s = sub.add_parser("read", help="mark a paper read")
+    s = sub.add_parser("read", help="mark a paper read (or a video watched)")
     s.add_argument("id", type=int)
     s.add_argument("--unread", action="store_true", help="mark as unread again")
     s.set_defaults(func=cmd_read)
@@ -581,6 +661,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv == ["media-worker"]:  # hidden; kept out of argparse so it is not listed in --help
+        return cmd_media_worker()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

@@ -23,7 +23,7 @@ def test_migrations(tmp_path: Path) -> None:
     Store(tmp_path / "pq.db")
     Store(tmp_path / "pq.db")  # reopening is a no-op
     con = sqlite3.connect(tmp_path / "pq.db")
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 2
     assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     cols = {r[1] for r in con.execute("PRAGMA table_info(papers)")}
     assert {"updated_at", "pdf_path", "calendar_hash", "title_key", "needs_metadata"} <= cols
@@ -148,3 +148,61 @@ def test_counts_and_rev(store: Store) -> None:
     assert store.bump_rev() == 1
     assert store.bump_rev() == 2
     assert store.rev() == 2
+
+
+def test_migration_from_v1_database(tmp_path: Path) -> None:
+    from paperqueue.db import MIGRATIONS
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    for statement in filter(str.strip, MIGRATIONS[0].split(";")):
+        con.execute(statement)
+    con.execute(
+        "INSERT INTO papers (title, added_at, updated_at, scheduled_start, duration_minutes) "
+        "VALUES ('An old paper from version one', '2026-01-01T00:00:00+00:00', "
+        "'2026-01-01T00:00:00+00:00', '2026-11-16T07:30:00+00:00', 45)"
+    )
+    con.execute("PRAGMA user_version = 1")
+    con.commit()
+    con.close()
+
+    store = Store(path)
+    (old,) = store.list(status="all")
+    assert (old.kind, old.media_mode, old.video_id, old.media_status, old.duration_seconds) == (
+        "paper", "link", None, None, None)
+    assert old.duration_minutes == 45
+    raw = sqlite3.connect(path)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+    indexes = {r[1] for r in raw.execute("PRAGMA index_list(papers)")}
+    assert "ux_papers_video" in indexes
+    video = add(store, "A video", kind="video", video_id="dQw4w9WgXcQ")
+    with pytest.raises(sqlite3.IntegrityError):
+        add(store, "Same video again", kind="video", video_id="dQw4w9WgXcQ")
+    assert store.find_duplicate(video_id="dQw4w9WgXcQ") == video
+
+
+def test_videos_never_match_by_title(store: Store) -> None:
+    lecture = add(store, "Lecture 1: Introduction to the course", kind="video", video_id="aaaaaaaaaaa")
+    assert store.find_duplicate(video_id="bbbbbbbbbbb", title=lecture.title) is None
+    assert store.find_duplicate(title=lecture.title) is None  # a paper with the same title is new
+    paper = add(store, "Lecture 1: Introduction to the course")
+    assert store.find_duplicate(title=lecture.title) == paper
+
+
+def test_list_media_pending_and_to_dict(store: Store, tmp_path: Path) -> None:
+    add(store, "Link only video", kind="video", video_id="aaaaaaaaaaa")
+    pending = add(store, "Audio video", kind="video", video_id="bbbbbbbbbbb", media_mode="audio",
+                  media_status="pending")
+    failed = add(store, "Failed video", kind="video", video_id="ccccccccccc", media_mode="video",
+                 media_status="failed", media_error="no_ffmpeg", scheduled_start="2026-11-16T07:30:00+00:00")
+    f = tmp_path / "x.m4a"
+    f.write_bytes(b"a")
+    add(store, "Done video", kind="video", video_id="ddddddddddd", media_mode="audio", media_status="done",
+        media_path=str(f))
+    add(store, "Watched video", kind="video", video_id="eeeeeeeeeee", media_mode="audio", status="read")
+    assert [p.id for p in store.list_media_pending()] == [failed.id, pending.id]  # scheduled first
+    done = store.find_duplicate(video_id="ddddddddddd")
+    assert done is not None
+    d = done.to_dict()
+    assert d["has_media"] is True and "media_path" not in d and d["kind"] == "video"
+    assert pending.to_dict()["has_media"] is False

@@ -131,3 +131,20 @@ def test_zone_from_path_variants():
     assert zone_from_path("/var/db/timezone/zoneinfo/Europe/Berlin") == "Europe/Berlin"
     assert zone_from_path("/usr/share/zoneinfo.default/America/New_York") == "America/New_York"
     assert zone_from_path("/etc/localtime") == ""
+
+
+def test_durations(cfg: Config) -> None:
+    busy = [(utc(2026, 11, 16, 9, 0), utc(2026, 11, 16, 10, 0))]  # 10:00-11:00 Berlin
+    cfg.schedule.times = ["08:30", "11:00"]
+    assert scheduler.parse_when("today", cfg, busy, NOW) == utc(2026, 11, 16, 7, 30)
+    assert scheduler.parse_when("today", cfg, busy, NOW, duration=90) == utc(2026, 11, 16, 7, 30)  # ends 10:00
+    # 120 minutes from 08:30 run into the busy hour, so the 11:00 slot is the first that fits
+    assert scheduler.parse_when("today", cfg, busy, NOW, duration=120) == utc(2026, 11, 16, 10, 0)
+    assert scheduler.parse_when("next", cfg, busy, NOW, duration=120) == utc(2026, 11, 16, 10, 0)
+
+    papers = [Paper(id=1, title="long", priority=1), Paper(id=2, title="short", priority=2)]
+    long_first = scheduler.plan(papers, cfg, [], NOW, duration_of=lambda p: 150 if p.id == 1 else 45)
+    # the 150-minute session (08:30-11:00) leaves 11:00 free for the next one
+    assert long_first == [(1, utc(2026, 11, 16, 7, 30)), (2, utc(2026, 11, 16, 10, 0))]
+    clash = scheduler.plan(papers, cfg, [], NOW, duration_of=lambda p: 160 if p.id == 1 else 45)
+    assert clash[1] == (2, utc(2026, 11, 17, 7, 30))

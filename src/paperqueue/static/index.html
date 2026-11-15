@@ -28,7 +28,7 @@
     <form class="addbar" id="add-form" autocomplete="off">
       <label class="visually-hidden" for="add-ref">Add a paper</label>
       <input class="addbar-input" id="add-ref" name="ref" type="text" required
-             placeholder="Paste an arXiv ID, DOI, URL or title" spellcheck="false">
+             placeholder="Paste a paper or YouTube link" title="arXiv ID, DOI, paper URL, title or YouTube link" spellcheck="false">
       <div class="addbar-options">
         <label class="inline-field">
           <span class="inline-label">Priority</span>
@@ -43,6 +43,14 @@
           <select id="add-when" name="when">
             <option value="next" selected>Next free slot</option>
             <option value="none">None</option>
+          </select>
+        </label>
+        <label class="inline-field" id="add-media-field" hidden>
+          <span class="inline-label">Keep</span>
+          <select id="add-media" name="media">
+            <option value="link">Link only</option>
+            <option value="audio">Audio download</option>
+            <option value="video">Video download</option>
           </select>
         </label>
         <button class="button button-primary" id="add-submit" type="submit">Add</button>
@@ -84,6 +92,10 @@
           <dd><span id="pdf-status">…</span></dd>
         </div>
         <div class="status-row">
+          <dt>YouTube</dt>
+          <dd><span id="media-status">…</span></dd>
+        </div>
+        <div class="status-row">
           <dt>Bookmarklet</dt>
           <dd><a class="bookmarklet" id="bookmarklet" href="#" draggable="true">Save to paperqueue</a>
             <span class="hint">Drag to your bookmarks bar, then click it on any paper page.</span></dd>
@@ -99,7 +111,7 @@
 
   <dialog class="dialog" id="schedule-dialog" aria-labelledby="schedule-title">
     <form method="dialog" class="dialog-body" id="schedule-form">
-      <p class="dialog-kicker">Schedule reading</p>
+      <p class="dialog-kicker" id="schedule-kicker">Schedule reading</p>
       <h2 class="dialog-title" id="schedule-title"></h2>
       <p class="dialog-current" id="schedule-current"></p>
       <div class="field-row">
@@ -144,7 +156,7 @@
           <li>On this Mac, run <code>paperqueue serve --lan</code> and scan the QR code it prints (it also appears here).</li>
           <li>In Safari on the iPhone, tap Share, then Add to Home Screen for an app-like queue.</li>
           <li>Reading sessions are already on your iPhone through the iCloud calendar, with a reminder before each one.</li>
-          <li>Cached PDFs are in iCloud Drive, in the <span class="nowrap">PaperQueue</span> folder of the Files app, for offline reading.</li>
+          <li>Cached PDFs are in iCloud Drive, in the <span class="nowrap">PaperQueue</span> folder of the Files app, for offline reading; downloaded videos are in <span class="nowrap">PaperQueue/Media</span>.</li>
         </ol>
       </div>
       <div class="dialog-actions">

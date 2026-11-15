@@ -5,15 +5,21 @@ from __future__ import annotations
 import difflib
 import html
 import ipaddress
+import json
+import os
 import re
+import shutil
+import signal
 import socket
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlsplit
 
 import httpx
 
@@ -38,6 +44,13 @@ PUBMED_RE = re.compile(
     r"(?:pubmed\.ncbi\.nlm\.nih\.gov/|europepmc\.org/(?:abstract|article)/MED/|^pmid:?\s*)(\d{5,9})",
     re.I,
 )
+YOUTUBE_RE = re.compile(r"^(?:https?://)?(?:(?:www|m)\.)?(youtube\.com|youtu\.be)(?=[/?#]|$)", re.I)
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+YTDLP = [sys.executable, "-m", "yt_dlp"]
+YTDLP_PROBE_TIMEOUT = 20.0
+DESCRIPTION_MAX = 1500
+# Homebrew's bin dirs, which launchd and some GUI-launched MCP clients leave off PATH.
+TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV_NS = "{http://arxiv.org/schemas/atom}"
 EUROPEPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -63,7 +76,7 @@ class MetadataError(ValueError):
 
 @dataclass
 class Ref:
-    kind: str  # arxiv | doi | pubmed | pmc | url | text
+    kind: str  # arxiv | doi | pubmed | pmc | youtube | url | text
     value: str
     version: int | None = None  # bioRxiv/medRxiv version, when the reference names one
 
@@ -79,7 +92,9 @@ class PaperMeta:
     pdf_url: str | None = None
     doi: str | None = None
     arxiv_id: str | None = None
-    matched_by: str = "identifier"
+    video_id: str | None = None
+    duration_seconds: int | None = None
+    matched_by: str = "identifier"  # also: title search, web page, Europe PMC, hints, oembed, minimal
 
 
 def _clean_doi(doi: str) -> str:
@@ -89,8 +104,35 @@ def _clean_doi(doi: str) -> str:
     )
 
 
+def watch_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _youtube_ref(s: str) -> Ref:
+    """A youtube.com / youtu.be URL -> Ref("youtube", id). Raises MetadataError for playlists
+    and other pages that name no single video."""
+    parts = urlsplit(s if re.match(r"^https?://", s, re.I) else f"https://{s}")
+    host = (parts.hostname or "").lower()
+    path = [x for x in parts.path.split("/") if x]
+    query = parse_qs(parts.query)
+    candidate = ""
+    if host == "youtu.be":
+        candidate = path[0] if path else ""
+    elif path == ["watch"]:
+        candidate = (query.get("v") or [""])[0]
+    elif len(path) >= 2 and path[0] in ("shorts", "live", "embed", "v"):
+        candidate = path[1]
+    if VIDEO_ID_RE.match(candidate):
+        return Ref("youtube", candidate)
+    if "list" in query or path[:1] == ["playlist"]:
+        raise MetadataError("YouTube playlists are not supported; add the videos one at a time")
+    raise MetadataError(f"not a YouTube video link: {s}")
+
+
 def parse_ref(ref: str) -> Ref:
     s = ref.strip().strip("<>").strip()
+    if YOUTUBE_RE.match(s):
+        return _youtube_ref(s)
     if m := ARXIV_ID_RE.match(s):
         return Ref("arxiv", m.group(1))
     if m := ARXIV_URL_RE.search(s):
@@ -137,6 +179,62 @@ def _norm(s: str) -> str:
 def _year(text: str | None) -> int | None:
     m = re.search(r"(?:19|20)\d{2}", text or "")
     return int(m.group()) if m else None
+
+
+# --- yt-dlp ------------------------------------------------------------------------
+
+
+def find_tool(name: str) -> str | None:
+    """Path of an executable on PATH or in Homebrew's bin dirs."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in TOOL_DIRS:
+        path = os.path.join(directory, name)
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def run_ytdlp(
+    args: list[str], timeout: float, pass_fds: tuple[int, ...] = ()
+) -> subprocess.CompletedProcess[str]:
+    """Run yt-dlp as a child process in its own process group, with no stdin and captured
+    output (so it can never write to an MCP stdio channel). On timeout the whole group
+    (yt-dlp and any ffmpeg it started) is killed and TimeoutExpired is raised."""
+    with subprocess.Popen(
+        [*YTDLP, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        start_new_session=True,
+        pass_fds=pass_fds,
+    ) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def js_runtime_args() -> list[str]:
+    """yt-dlp needs a JavaScript runtime (Deno) for YouTube; point it at Deno explicitly."""
+    deno = find_tool("deno")
+    return ["--js-runtimes", f"deno:{deno}"] if deno else []
+
+
+def _trim(text: str | None, limit: int) -> str | None:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text or None
+    return text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:.-") + "…"
 
 
 # --- SSRF guard -----------------------------------------------------------------
@@ -296,7 +394,9 @@ class Resolver:
         r = parse_ref(ref)
         hinted = meta_from_hints(hints, ref if r.kind == "url" else None) if hints else None
         attempts: list[Callable[[], PaperMeta]] = []
-        if r.kind == "arxiv":
+        if r.kind == "youtube":
+            attempts.append(lambda: self._youtube(r.value))
+        elif r.kind == "arxiv":
             attempts.append(lambda: self.arxiv(r.value))
         elif r.kind == "doi":
             attempts += self._doi_attempts(r.value, r.version)
@@ -327,6 +427,8 @@ class Resolver:
                 errors.append(f"{type(exc).__name__}: {exc}")
         if hinted:
             hinted.pdf_url = hinted.pdf_url or pdf_url
+            if r.kind == "youtube":
+                hinted.url, hinted.venue, hinted.video_id = watch_url(r.value), "YouTube", r.value
             return hinted
         raise MetadataError(
             f"could not resolve {ref!r}: " + "; ".join(errors or ["no source"]), candidates, pdf_url
@@ -340,6 +442,53 @@ class Resolver:
         ]
 
     # sources --------------------------------------------------------------
+
+    def _youtube(self, video_id: str) -> PaperMeta:
+        """Video metadata from yt-dlp; if that fails, title and channel from YouTube oEmbed
+        (matched_by "oembed", so the record is retried later for the length and description)."""
+        url = watch_url(video_id)
+        try:
+            proc = run_ytdlp(
+                ["-J", "--no-playlist", "--ignore-no-formats-error", *js_runtime_args(), "--", url],
+                timeout=YTDLP_PROBE_TIMEOUT,
+            )
+            if proc.returncode == 0:
+                info = json.loads(proc.stdout)
+                title = str(info.get("title") or "").strip()
+                if title:
+                    duration = info.get("duration")
+                    channel = info.get("channel") or info.get("uploader")
+                    return PaperMeta(
+                        title=title,
+                        authors=[str(channel)] if channel else [],
+                        year=_year(str(info.get("upload_date") or "")[:4]),
+                        venue="YouTube",
+                        abstract=_trim(info.get("description"), DESCRIPTION_MAX),
+                        url=url,
+                        video_id=video_id,
+                        duration_seconds=int(duration) if isinstance(duration, (int, float)) else None,
+                    )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        resp = self.client.get(
+            "https://www.youtube.com/oembed", params={"url": url, "format": "json"}
+        )
+        if resp.status_code in (401, 403, 404):
+            raise MetadataError(f"YouTube video {video_id} is unavailable or private")
+        resp.raise_for_status()
+        data = resp.json()
+        title = str(data.get("title") or "").strip()
+        if not title:
+            raise MetadataError(f"YouTube has no title for video {video_id}")
+        channel = str(data.get("author_name") or "").strip()
+        return PaperMeta(
+            title=title,
+            authors=[channel] if channel else [],
+            venue="YouTube",
+            url=url,
+            video_id=video_id,
+            matched_by="oembed",
+        )
 
     def arxiv(self, arxiv_id: str) -> PaperMeta:
         resp = self.client.get(

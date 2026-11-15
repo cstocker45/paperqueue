@@ -50,6 +50,7 @@ def home(tmp_path, monkeypatch):
         '[library]\nprovider = "off"\n'
         '[calendar]\nbackend = "off"\n'
         '[pdf]\nenabled = false\n'
+        f'[media]\ndir = "{tmp_path / "Media"}"\n'
         '[schedule]\ntimezone = "Europe/Berlin"\n'
     )
     monkeypatch.setenv("PAPERQUEUE_HOME", str(h))
@@ -91,10 +92,11 @@ def test_tools_and_instructions(server):
     names = {t.name for t in asyncio.run(server.list_tools())}
     assert names == {
         "add_paper", "list_reading_list", "get_paper", "schedule_paper", "auto_schedule", "upcoming",
-        "mark_read", "update_paper", "remove_paper", "free_slots", "sync_library",
+        "mark_read", "update_paper", "remove_paper", "free_slots", "sync_library", "set_media",
     }
     text = server.instructions
-    for phrase in ("without", "already_queued", "local time", "Never mark papers read", "upcoming"):
+    for phrase in ("without", "already_queued", "local time", "Never mark papers read", "upcoming",
+                   "YouTube", 'media="audio"', "set_media", "Terms of Service"):
         assert phrase.lower() in text.lower()
 
 
@@ -189,3 +191,32 @@ def test_server_does_not_print(home, capsys):
     build_server(make_queue(home))
     assert capsys.readouterr().out == ""
     assert mcp_server.INSTRUCTIONS
+
+
+def test_youtube_link_then_audio(server, ytdlp, kicks):
+    out = call(server, "add_paper", ref="https://youtu.be/dQw4w9WgXcQ?t=10", tags=["ml"])
+    assert out["status"] == "added"
+    p = out["paper"]
+    assert (p["kind"], p["channel"], p["length"], p["media"]) == ("video", "Some Channel", "42 min", {"mode": "link"})
+    assert "authors" not in p and p["links"]["url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert p["duration_minutes"] == 45 and kicks == []
+
+    res = call(server, "set_media", paper_id=p["id"], mode="audio")
+    assert res["paper"]["media"] == {"mode": "audio", "status": "pending"} and len(kicks) == 1
+
+    again = call(server, "add_paper", ref="https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL1")
+    assert again["status"] == "already_queued" and again["paper"]["id"] == p["id"]
+    with pytest.raises(Exception, match="not a video"):
+        call(server, "set_media", paper_id=call(server, "add_paper", ref="1706.03762")["paper"]["id"], mode="audio")
+
+
+def test_failed_download_reports_fix(server, ytdlp, monkeypatch):
+    from paperqueue import metadata
+
+    monkeypatch.setattr(metadata, "find_tool", lambda name: "/x/deno" if name == "deno" else None)
+    out = call(server, "add_paper", ref="https://youtu.be/dQw4w9WgXcQ", media="video", when="none")
+    media = out["paper"]["media"]
+    assert (media["status"], media["error"]) == ("failed", "no_ffmpeg")
+    assert "brew install ffmpeg" in media["fix"] and "brew install ffmpeg" in out["warnings"][0]
+    full = call(server, "get_paper", paper_id=out["paper"]["id"])
+    assert full["media"]["error"] == "no_ffmpeg"

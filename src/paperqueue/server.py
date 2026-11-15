@@ -29,6 +29,9 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .mediacache import SUFFIXES as MEDIA_TYPES
+from .mediacache import fix_for
+
 STATIC_DIR = Path(__file__).parent / "static"
 COOKIE_NAME = "pq_token"
 COOKIE_MAX_AGE = 400 * 24 * 3600  # browsers cap cookie lifetime at 400 days
@@ -47,7 +50,7 @@ PUBLIC_PATHS = frozenset(
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
-        "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
+        "default-src 'self'; img-src 'self' data: https://i.ytimg.com; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
     ),
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
@@ -67,6 +70,7 @@ class AddBody(BaseModel):
     notes: str = ""
     when: str | None = None
     source: str = "web"
+    media: str | None = None
 
 
 class UpdateBody(BaseModel):
@@ -81,6 +85,10 @@ class UpdateBody(BaseModel):
 class ScheduleBody(BaseModel):
     when: str | None = "next"
     duration_minutes: int | None = None
+
+
+class MediaBody(BaseModel):
+    mode: str
 
 
 class ReadBody(BaseModel):
@@ -236,6 +244,8 @@ def create_app(
         d = _jsonable(paper.to_dict(tz()))
         if not d.get("library_link"):
             d["library_link"] = library_link(paper)
+        if d.get("media_error"):
+            d["media_fix"] = fix_for(d["media_error"])
         return d
 
     def lan_urls() -> list[str]:
@@ -366,6 +376,7 @@ def create_app(
             notes=body.notes,
             when=body.when or None,
             source=source,
+            media=body.media or None,
         )
         return JSONResponse(
             {"paper": pdict(res.paper), "created": res.created, "warnings": list(res.warnings)},
@@ -420,6 +431,31 @@ def create_app(
             path, media_type="application/pdf", filename=path.name, content_disposition_type="inline"
         )
 
+    @app.post("/api/papers/{paper_id}/media")
+    def set_media(paper_id: int, body: MediaBody) -> dict[str, Any]:
+        res = q.set_media(paper_id, body.mode)
+        return {"paper": pdict(res.paper), "warnings": list(res.warnings)}
+
+    @app.get("/api/papers/{paper_id}/media")
+    def paper_media(paper_id: int) -> Response:
+        # Same confinement as the PDF route, plus a suffix allowlist with a fixed media type each.
+        # FileResponse answers Range requests (206), which audio/video seeking needs.
+        paper = q.get(paper_id)
+        raw = getattr(paper, "media_path", None)
+        media_dir = _cfg_get(cfg, "media", "dir")
+        missing = f"no downloaded media for item {paper_id}"
+        if not raw or not media_dir:
+            raise KeyError(missing)
+        try:
+            root = Path(media_dir).expanduser().resolve()
+            path = Path(raw).expanduser().resolve()
+        except (OSError, RuntimeError):
+            raise KeyError(missing) from None
+        media_type = MEDIA_TYPES.get(path.suffix.lower())
+        if not path.is_relative_to(root) or media_type is None or not path.is_file():
+            raise KeyError(missing)
+        return FileResponse(path, media_type=media_type, filename=path.name, content_disposition_type="inline")
+
     @app.post("/api/auto-schedule")
     def auto_schedule(body: AutoScheduleBody = Body(default_factory=AutoScheduleBody)):
         res = q.auto_schedule(include_missed=body.include_missed, limit=body.limit)
@@ -430,10 +466,10 @@ def create_app(
         }
 
     @app.get("/api/slots")
-    def slots(n: int = Query(5, ge=1, le=50)) -> dict[str, Any]:
+    def slots(n: int = Query(5, ge=1, le=50), paper_id: int | None = None) -> dict[str, Any]:
         zone = tz()
         out = []
-        for dt in q.free_slots(n=n):
+        for dt in q.free_slots(n=n, paper_id=paper_id):
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             out.append({"utc": dt.astimezone(timezone.utc).isoformat(), "local": dt.astimezone(zone).isoformat()})

@@ -25,7 +25,7 @@ READ_DIR = "Read"
 _UNSAFE = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]+')
 
 
-def _clean(text: str) -> str:
+def safe_name(text: str) -> str:
     text = unicodedata.normalize("NFC", text)
     return " ".join(_UNSAFE.sub(" ", text).split())
 
@@ -40,7 +40,7 @@ def _surname(author: str) -> str:
 
 def filename(paper: Paper) -> str:
     """`<FirstAuthorSurname> <year> - <short title>.pdf`, safe on APFS/iCloud and in URLs."""
-    words = _clean(paper.title).split()
+    words = safe_name(paper.title).split()
     short = ""
     for word in words:
         if len(short) + len(word) + 1 > 60:
@@ -48,7 +48,7 @@ def filename(paper: Paper) -> str:
         short = f"{short} {word}".strip()
     short = short or (words[0][:60] if words else f"paper {paper.id}")
     lead = " ".join(
-        x for x in (_clean(_surname(paper.authors[0])) if paper.authors else "", str(paper.year or "")) if x
+        x for x in (safe_name(_surname(paper.authors[0])) if paper.authors else "", str(paper.year or "")) if x
     )
     name = f"{lead} - {short}" if lead else short
     return name.lstrip(". ")[:150] + ".pdf"

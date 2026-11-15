@@ -120,6 +120,7 @@
     reloadQueued: false,
     hiding: new Set(), // ids pending removal (undo window)
     dialogPaper: null,
+    players: new Map(), // audio/video elements kept across re-renders, so playback continues
   };
 
   function tzName() {
@@ -280,6 +281,136 @@
     return whenText(iso);
   }
 
+  function lengthText(seconds) {
+    const mins = Math.max(1, Math.round(Number(seconds) / 60));
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    if (!h) return `${mins} min`;
+    return m ? `${h} h ${m} min` : `${h} h`;
+  }
+
+  // ---------------------------------------------------------------- YouTube
+
+  const YOUTUBE_RE = /^(?:https?:\/\/)?(?:(?:www|m)\.)?(?:youtube\.com|youtu\.be)(?:[/?#]|$)/i;
+  const MEDIA_MODES = [
+    ["link", "Link"],
+    ["audio", "Audio"],
+    ["video", "Video"],
+  ];
+
+  function isVideo(p) {
+    return p.kind === "video";
+  }
+
+  function thumbUrl(p) {
+    return /^[A-Za-z0-9_-]{11}$/.test(p.video_id || "") ? `https://i.ytimg.com/vi/${p.video_id}/mqdefault.jpg` : null;
+  }
+
+  function videoMinutes(p) {
+    const sched = (state.status && state.status.schedule) || {};
+    if (!isVideo(p) || !p.duration_seconds) return null;
+    const mins = Math.max(5, Math.ceil(p.duration_seconds / 300) * 5);
+    return Math.min(mins, sched.max_session_minutes || 90);
+  }
+
+  // Playback position per item, so a long video resumes where it stopped (even on another visit).
+  function loadPos(id) {
+    try {
+      return Number(localStorage.getItem(`pq.pos.${id}`)) || 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function savePos(id, seconds) {
+    try {
+      if (seconds > 0) localStorage.setItem(`pq.pos.${id}`, String(Math.floor(seconds)));
+      else localStorage.removeItem(`pq.pos.${id}`);
+    } catch (_) {}
+  }
+
+  function player(p, tag, poster) {
+    const src = `/api/papers/${encodeURIComponent(p.id)}/media`;
+    const key = `${p.id}:${p.media_mode}`;
+    const kept = state.players.get(key);
+    if (kept) return kept;
+    const node = el(tag, {
+      class: `media-player media-${tag}`,
+      controls: true,
+      preload: "metadata",
+      playsinline: tag === "video",
+      poster: poster || null,
+      src,
+      dataset: { key },
+      "aria-label": `${tag === "audio" ? "Listen to" : "Watch"} ${p.title}`,
+    });
+    node.addEventListener(
+      "loadedmetadata",
+      () => {
+        const at = loadPos(p.id);
+        if (at > 0 && (!node.duration || at < node.duration - 5)) node.currentTime = at;
+      },
+      { once: true }
+    );
+    let saved = 0;
+    node.addEventListener("timeupdate", () => {
+      if (Math.abs(node.currentTime - saved) >= 5) {
+        saved = node.currentTime;
+        savePos(p.id, saved);
+      }
+    });
+    node.addEventListener("pause", () => savePos(p.id, node.currentTime));
+    node.addEventListener("ended", () => savePos(p.id, 0));
+    return node;
+  }
+
+  function mediaStateText(p) {
+    if (p.media_mode === "link") return "";
+    if (p.media_status === "downloading") return "Downloading…";
+    if (p.media_status === "done") return p.has_media ? "Saved to iCloud Drive" : "Saved, but the file is not on this Mac";
+    if (p.media_status === "failed") return p.media_fix || "Download failed";
+    return "Waiting to download";
+  }
+
+  function mediaBlock(p) {
+    const wrap = el("div", { class: "media" });
+    const thumb = thumbUrl(p);
+    if (p.has_media && p.media_mode === "video") {
+      wrap.append(player(p, "video", thumb));
+    } else {
+      const yt = safeUrl(p.url);
+      if (thumb && yt) {
+        wrap.append(
+          el("a", { class: "media-thumb", href: yt, target: "_blank", rel: "noopener noreferrer", tabindex: "-1", "aria-hidden": "true" }, [
+            el("img", { src: thumb, alt: "", loading: "lazy", width: "320", height: "180" }),
+          ])
+        );
+      }
+      if (p.has_media && p.media_mode === "audio") wrap.append(player(p, "audio"));
+    }
+    if (p.status !== "read") {
+      const group = el(
+        "div",
+        { class: "segmented", role: "group", "aria-label": "Keep as" },
+        MEDIA_MODES.map(([mode, label]) =>
+          el("button", {
+            class: "segment",
+            type: "button",
+            text: label,
+            "aria-pressed": String(p.media_mode === mode),
+            title: mode === "link" ? "Keep only the YouTube link" : `Download the ${mode} for offline use`,
+            onclick: (e) => setMedia(p, mode, e.currentTarget),
+          })
+        )
+      );
+      const row = el("div", { class: "media-row" }, [group]);
+      const text = mediaStateText(p);
+      if (text) row.append(el("span", { class: `media-state${p.media_status === "failed" ? " is-failed" : ""}`, text }));
+      wrap.append(row);
+    }
+    return wrap;
+  }
+
   function prettyDir(dir) {
     if (!dir) return "";
     const icloud = String(dir).match(/com~apple~CloudDocs\/(.*)$/);
@@ -368,6 +499,7 @@
 
   function render(groups) {
     const list = $("#list");
+    state.players = new Map(Array.from(list.querySelectorAll(".media-player"), (n) => [n.dataset.key, n]));
     renderViewbar(groups);
     const frag = document.createDocumentFragment();
     if (!groups.length) {
@@ -396,6 +528,7 @@
       frag.append(section);
     }
     list.replaceChildren(frag);
+    state.players = new Map();
   }
 
   function renderViewbar(groups) {
@@ -423,7 +556,7 @@
     const filtered = state.q || state.tag;
     const copy = {
       upcoming: ["Nothing scheduled", "Add a paper above, or open the Queue and press Auto-schedule to fill your reading slots."],
-      queue: ["The queue is empty", "Paste an arXiv ID, DOI, URL or title above, or use the bookmarklet on any paper page."],
+      queue: ["The queue is empty", "Paste an arXiv ID, DOI, URL, title or YouTube link above, or use the bookmarklet on any paper page."],
       read: ["Nothing read yet", "Papers you mark as read collect here."],
     }[state.view];
     const [title, text] = filtered ? ["No matches", "Try a different search or clear the tag filter."] : copy;
@@ -479,14 +612,20 @@
     );
 
     const by = [];
-    const authors = authorLine(p.authors);
-    if (authors) by.push(el("span", { text: authors, title: (p.authors || []).join(", ") }));
-    const venueYear = [p.venue, p.year].filter(Boolean).join(" · ");
-    if (venueYear) {
-      if (by.length) by.push(el("span", { class: "sep", text: "—", "aria-hidden": "true" }));
-      by.push(el("span", { text: venueYear }));
+    if (isVideo(p)) {
+      const parts = [p.duration_seconds ? `▶ ${lengthText(p.duration_seconds)}` : "▶ YouTube", (p.authors || [])[0]];
+      by.push(el("span", { text: parts.filter(Boolean).join(" · ") }));
+    } else {
+      const authors = authorLine(p.authors);
+      if (authors) by.push(el("span", { text: authors, title: (p.authors || []).join(", ") }));
+      const venueYear = [p.venue, p.year].filter(Boolean).join(" · ");
+      if (venueYear) {
+        if (by.length) by.push(el("span", { class: "sep", text: "—", "aria-hidden": "true" }));
+        by.push(el("span", { text: venueYear }));
+      }
     }
     if (by.length) main.append(el("p", { class: "paper-byline" }, by));
+    if (isVideo(p)) main.append(mediaBlock(p));
 
     if ((p.tags || []).length) {
       main.append(
@@ -516,7 +655,10 @@
     // actions
     const actions = el("div", { class: "paper-actions" });
     const pdfHref = p.has_pdf ? `/api/papers/${encodeURIComponent(p.id)}/pdf` : safeUrl(p.pdf_url);
-    if (pdfHref) {
+    const ytHref = isVideo(p) ? safeUrl(p.url) : null;
+    if (ytHref) {
+      actions.append(el("a", { href: ytHref, target: "_blank", rel: "noopener noreferrer", text: "YouTube", title: "Open on YouTube" }));
+    } else if (pdfHref) {
       actions.append(
         el("a", {
           href: pdfHref,
@@ -541,7 +683,7 @@
       el("button", {
         class: "link-button",
         type: "button",
-        text: isRead ? "Back to queue" : "Mark read",
+        text: isRead ? "Back to queue" : isVideo(p) ? "Mark watched" : "Mark read",
         onclick: (e) => markRead(p, !isRead, e.currentTarget),
       })
     );
@@ -601,7 +743,7 @@
   async function markRead(p, read, button) {
     const data = await withBusy(button, () => api(`/api/papers/${p.id}/read`, { method: "POST", body: { read } }));
     if (!data) return;
-    toast(read ? `Marked as read: ${p.title}` : `Back in the queue: ${p.title}`, {
+    toast(read ? `Marked as ${isVideo(p) ? "watched" : "read"}: ${p.title}` : `Back in the queue: ${p.title}`, {
       action: { label: "Undo", run: () => markRead(p, !read, null) },
     });
     await afterMutation(data);
@@ -648,6 +790,14 @@
     for (const flush of pendingRemovals.values()) flush();
   });
 
+  async function setMedia(p, mode, button) {
+    const data = await withBusy(button, () => api(`/api/papers/${p.id}/media`, { method: "POST", body: { mode } }));
+    if (!data) return;
+    const failed = data.paper && data.paper.media_status === "failed";
+    if (mode !== "link" && !failed) toast(`Downloading the ${mode} in the background.`);
+    await afterMutation(data);
+  }
+
   async function autoSchedule(includeMissed, button) {
     const data = await withBusy(button, () =>
       api("/api/auto-schedule", { method: "POST", body: { include_missed: includeMissed } })
@@ -672,17 +822,12 @@
     const button = $("#add-submit");
     button.disabled = true;
     button.textContent = "Adding…";
+    const body = { ref, priority: Number($("#add-priority").value), when: $("#add-when").value, source: "web" };
+    if (!$("#add-media-field").hidden) body.media = $("#add-media").value;
     try {
-      const data = await api("/api/papers", {
-        method: "POST",
-        body: {
-          ref,
-          priority: Number($("#add-priority").value),
-          when: $("#add-when").value,
-          source: "web",
-        },
-      });
+      const data = await api("/api/papers", { method: "POST", body });
       input.value = "";
+      updateAddMedia();
       const p = data.paper;
       const iso = startIso(p);
       if (!data.created) toast(`Already in your list: ${p.title}`);
@@ -705,6 +850,7 @@
   async function openSchedule(p) {
     state.dialogPaper = p;
     $("#schedule-title").textContent = p.title || "Untitled";
+    $("#schedule-kicker").textContent = isVideo(p) ? (p.media_mode === "audio" ? "Schedule listening" : "Schedule watching") : "Schedule reading";
     const iso = startIso(p);
     $("#schedule-current").textContent = iso ? `Currently ${whenText(iso)}${isMissed(p) ? " (missed)" : ""}` : "Not scheduled yet";
     $("#schedule-clear").hidden = !iso;
@@ -713,12 +859,12 @@
     at.min = zonedParts(new Date()).local;
     const dur = $("#schedule-duration");
     const defaultDur = state.status && state.status.schedule && state.status.schedule.duration_minutes;
-    dur.value = p.duration_minutes || defaultDur || 45;
+    dur.value = p.duration_minutes || videoMinutes(p) || defaultDur || 45;
     const chips = $("#schedule-slots");
     chips.replaceChildren(el("span", { class: "hint", text: "Loading…" }));
     sDialog.showModal();
     try {
-      const data = await api("/api/slots?n=6");
+      const data = await api(`/api/slots?n=6&paper_id=${encodeURIComponent(p.id)}`);
       const slots = data.slots || [];
       chips.replaceChildren(
         ...(slots.length
@@ -865,6 +1011,17 @@
       calBtn.hidden = false;
     }
 
+    const media = st.media || {};
+    const modeName = { link: "links only", audio: "audio downloads", video: "video downloads" }[media.default_mode] || "links only";
+    const notes = [`Default: ${modeName}`];
+    if (media.deno === false) notes.push("downloads need Deno (brew install deno)");
+    else if (media.ffmpeg === false) notes.push("video needs ffmpeg (brew install ffmpeg)");
+    if (media.pending) notes.push(`${media.pending} to download`);
+    if ((media.failed || []).length) notes.push(`${media.failed.length} failed`);
+    const mediaNode = $("#media-status");
+    setStatusText(mediaNode, notes.join(" · "), media.deno === false || (media.failed || []).length ? "bad" : media.deno ? "ok" : "off");
+    mediaNode.title = media.dir || "";
+
     const pdf = st.pdf || {};
     const pdfNode = $("#pdf-status");
     if (pdf.enabled === false) setStatusText(pdfNode, "Cache off", "off");
@@ -991,9 +1148,21 @@
     load();
   }
 
+  // The "Keep" selector appears only while the add bar holds a YouTube link.
+  function updateAddMedia() {
+    const field = $("#add-media-field");
+    const show = YOUTUBE_RE.test($("#add-ref").value.trim());
+    if (show && field.hidden) {
+      const mode = state.status && state.status.media && state.status.media.default_mode;
+      $("#add-media").value = mode || "link";
+    }
+    field.hidden = !show;
+  }
+
   for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => setView(t.dataset.view));
   $("#tag-clear").addEventListener("click", () => setTag(""));
   $("#add-form").addEventListener("submit", addPaper);
+  $("#add-ref").addEventListener("input", updateAddMedia);
 
   let searchTimer = null;
   $("#search").addEventListener("input", (e) => {

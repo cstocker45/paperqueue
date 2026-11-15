@@ -20,6 +20,14 @@ def test_defaults_and_permissions(tmp_path: Path) -> None:
     assert cfg.server.extra_hosts == []
     assert cfg.pdf.enabled is True
     assert cfg.pdf.dir == ICLOUD_PDF_DIR.expanduser()
+    m = cfg.media
+    assert (m.default_mode, m.max_height, m.max_video_mb, m.max_audio_mb, m.cookies_from_browser) == (
+        "link", 480, 1500, 300, "")
+    assert m.dir == (ICLOUD_PDF_DIR / "Media").expanduser()
+    assert cfg.schedule.max_session_minutes == 90
+    assert (cfg.media_lock_path, cfg.media_tmp_dir) == (home / "media.lock", home / "media-tmp")
+    raw = tomllib.loads(cfg.config_path.read_text())
+    assert raw["media"]["default_mode"] == "link" and raw["schedule"]["max_session_minutes"] == 90
     assert len(cfg.server.token) >= 20
     assert load_config(home).server.token == cfg.server.token
     tomllib.loads(cfg.config_path.read_text())
@@ -54,6 +62,11 @@ def test_generated_token_is_persisted(tmp_path: Path, text: str) -> None:
         ("[calendar]\nbackend = 'outlook'", "backend"),
         ("[pdf]\nenabled = 'yes'", "true or false"),
         ("[server]\nextra_hosts = 'pq.example'", "list"),
+        ("[media]\ndefault_mode = 'mp3'", "default_mode"),
+        ("[media]\nmax_height = 10", "max_height"),
+        ("[media]\nmax_video_mb = 0", "max_video_mb"),
+        ("[media]\ncookies_from_browser = '--exec=rm'", "cookies_from_browser"),
+        ("[schedule]\nmax_session_minutes = 1000", "max_session_minutes"),
         ("this is = = not toml", "config.toml"),
     ],
 )

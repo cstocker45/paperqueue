@@ -18,7 +18,18 @@ from paperqueue.metadata import MetadataError, PaperMeta, Resolver
 from paperqueue.service import PaperQueue, event_spec, parse_priority
 from paperqueue.types import LibraryItem, event_marker
 
-from .conftest import ARXIV_NOT_FOUND, Clock, FakeCalendar, FakeLibrary, Router, arxiv_atom, crossref_work
+from .conftest import (
+    ARXIV_NOT_FOUND,
+    VIDEO_ID,
+    Clock,
+    FakeCalendar,
+    FakeLibrary,
+    FakeYtDlp,
+    Router,
+    arxiv_atom,
+    crossref_work,
+    ytdlp_info,
+)
 
 PDF = b"%PDF-1.7\n" + b"0" * 500
 MON = "2026-11-16T07:30:00+00:00"  # 08:30 Berlin, the first free slot after NOW
@@ -460,13 +471,13 @@ def test_status(queue: PaperQueue, papers: Router, calendar: FakeCalendar, cfg: 
     cfg.mendeley.client_secret = "MENDELEY-SECRET"
     queue.add("2502.09775", when="next")
     s = queue.status()
-    assert set(s) == {"rev", "counts", "library", "calendar", "pdf", "schedule", "lan"}
+    assert set(s) == {"rev", "counts", "library", "calendar", "pdf", "media", "schedule", "lan"}
     assert set(s["library"]) == {"provider", "ok", "message", "can_write", "last_sync"}
     assert set(s["calendar"]) == {"backend", "name", "ok", "message"}
     assert s["calendar"]["ok"] is True and s["library"]["provider"] == "off"
     assert s["counts"]["scheduled"] == 1
     assert s["schedule"] == {"days": ["mon", "tue", "wed", "thu", "fri"], "times": ["08:30"],
-                             "duration_minutes": 45, "timezone": "Europe/Berlin"}
+                             "duration_minutes": 45, "max_session_minutes": 90, "timezone": "Europe/Berlin"}
     assert s["lan"] == {"enabled": False, "urls": []}
     dumped = json.dumps(s)
     for secret in ("ZOTERO-SECRET", "MENDELEY-SECRET", cfg.server.token):
@@ -496,3 +507,156 @@ def test_lazy_backends(cfg: Config, resolver: Resolver, clock: Clock, monkeypatc
     q = PaperQueue(cfg, resolver=resolver, clock=clock)
     assert q.calendar is fake_cal and q.library is fake_lib
     assert seen == [cfg, cfg.home]
+
+
+# --- YouTube videos --------------------------------------------------------------------
+
+WATCH = f"https://www.youtube.com/watch?v={VIDEO_ID}"
+
+
+def test_add_video_dedupes_url_variants(queue: PaperQueue, ytdlp: FakeYtDlp, kicks: list) -> None:
+    r = queue.add(f"https://youtu.be/{VIDEO_ID}", when="none")
+    p = r.paper
+    assert r.created and r.warnings == []
+    assert (p.kind, p.video_id, p.title, p.authors, p.venue, p.year, p.url) == (
+        "video", VIDEO_ID, "How Transformers Work", ["Some Channel"], "YouTube", 2024, WATCH)
+    assert (p.duration_seconds, p.media_mode, p.media_status, p.needs_metadata) == (2520, "link", None, False)
+    for variant in (f"{WATCH}&t=30s", f"{WATCH}&list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG",
+                    f"https://m.youtube.com/watch?v={VIDEO_ID}", f"https://www.youtube.com/shorts/{VIDEO_ID}"):
+        again = queue.add(variant)
+        assert not again.created and again.paper.id == p.id
+    assert len(ytdlp.calls) == 1  # duplicates are found without a lookup
+    assert kicks == []  # link mode downloads nothing
+    other = queue.add("https://youtu.be/abcdefghijk")
+    assert other.created and other.paper.id != p.id
+    with pytest.raises(MetadataError, match="playlists"):
+        queue.add("https://www.youtube.com/playlist?list=PLx0sYbCqOb8TBPRdmBHs5Iftvv9TPboYG")
+
+
+def test_video_session_follows_its_length(
+    queue: PaperQueue, ytdlp: FakeYtDlp, calendar: FakeCalendar, cfg: Config
+) -> None:
+    ytdlp.info[VIDEO_ID] = ytdlp_info(duration=2950)  # 49 min 10 s -> 50 min
+    v = queue.add(WATCH, when="next").paper
+    assert (v.scheduled_start, v.duration_minutes) == (MON, 50)
+    event = calendar.events[v.calendar_uid or ""]
+    assert event.title == "Watch: How Transformers Work"
+    assert event.url == WATCH
+    assert "YouTube · 2024 · 49 min" in event.notes and f"YouTube: {WATCH}" in event.notes
+
+    # the length is kept in duration_seconds, so it survives unschedule (which clears duration_minutes)
+    assert queue.unschedule(v.id or 0).paper.duration_minutes is None
+    assert queue.schedule(v.id or 0, "tomorrow").paper.duration_minutes == 50
+    queue.unschedule(v.id or 0)
+    assert queue.auto_schedule().papers[0].duration_minutes == 50
+
+    ytdlp.info["abcdefghijk"] = ytdlp_info("abcdefghijk", duration=3 * 3600)
+    long = queue.add("https://youtu.be/abcdefghijk", when="next").paper
+    assert long.duration_minutes == cfg.schedule.max_session_minutes == 90
+    assert queue.schedule(long.id or 0, "next", duration_minutes=120).paper.duration_minutes == 120
+
+
+def test_free_slots_fit_the_video(queue: PaperQueue, ytdlp: FakeYtDlp, papers: Router, cfg: Config) -> None:
+    cfg.schedule.times = ["08:30", "10:00"]
+    cfg.schedule.max_session_minutes = 120
+    ytdlp.info[VIDEO_ID] = ytdlp_info(duration=3 * 3600)
+    long = queue.add(WATCH).paper
+    paper = queue.add("2502.09775").paper
+    queue.schedule(paper.id or 0, "2026-11-16T10:00")
+    assert queue.free_slots(1)[0].isoformat() == MON  # 45 minutes fit before 10:00
+    assert queue.free_slots(1, paper_id=long.id)[0].isoformat() == TUE  # 120 minutes do not
+    with pytest.raises(ValueError, match="no free reading slot left"):
+        queue.schedule(long.id or 0, "today")  # "today" also needs room for the whole session
+    assert queue.schedule(long.id or 0, "tomorrow").paper.scheduled_start == TUE
+
+
+def test_set_media(queue: PaperQueue, ytdlp: FakeYtDlp, papers: Router, kicks: list, monkeypatch) -> None:
+    v = queue.add(WATCH).paper
+    assert v.id is not None
+    r = queue.set_media(v.id, "Audio")
+    assert (r.paper.media_mode, r.paper.media_status) == ("audio", "pending") and r.warnings == []
+    assert len(kicks) == 1
+    assert calendar_title(queue, v.id).startswith("Listen: ")
+    queue.set_media(v.id, "audio")  # already pending: no change, worker nudged again
+    assert len(kicks) == 2
+
+    from paperqueue import metadata
+
+    monkeypatch.setattr(metadata, "find_tool", lambda name: "/x/deno" if name == "deno" else None)
+    r = queue.set_media(v.id, "video")
+    assert (r.paper.media_status, r.paper.media_error) == ("failed", "no_ffmpeg")
+    assert "brew install ffmpeg" in r.warnings[-1] and len(kicks) == 2
+    assert queue.set_media(v.id, "link").paper.media_status is None
+
+    paper = queue.add("2502.09775").paper
+    with pytest.raises(ValueError, match="not a video"):
+        queue.set_media(paper.id or 0, "audio")
+    with pytest.raises(ValueError, match="invalid media mode"):
+        queue.set_media(v.id, "mp3")
+    with pytest.raises(ValueError, match="YouTube links only"):
+        queue.add("2401.00001", media="audio")
+    queue.mark_read(v.id)
+    with pytest.raises(ValueError, match="already watched"):
+        queue.set_media(v.id, "audio")
+
+
+def calendar_title(queue: PaperQueue, paper_id: int) -> str:
+    p = queue.get(paper_id)
+    return event_spec(p, queue.cfg).title if p.scheduled_start else service.event_title(p)
+
+
+def test_add_with_media_and_default_mode(queue: PaperQueue, ytdlp: FakeYtDlp, kicks: list, cfg: Config) -> None:
+    r = queue.add(WATCH, media="audio")
+    assert (r.paper.media_mode, r.paper.media_status) == ("audio", "pending") and len(kicks) == 1
+    again = queue.add(f"https://youtu.be/{VIDEO_ID}", media="video")  # explicit mode on a duplicate
+    assert not again.created and again.paper.media_mode == "video" and len(kicks) == 2
+    cfg.media.default_mode = "audio"
+    other = queue.add("https://youtu.be/abcdefghijk")
+    assert other.paper.media_mode == "audio"
+
+
+def test_watched_and_unwatched_video(queue: PaperQueue, ytdlp: FakeYtDlp, kicks: list, cfg: Config) -> None:
+    v = queue.add(WATCH, media="audio").paper
+    cfg.media.dir.mkdir()
+    f = cfg.media.dir / "x.m4a"
+    f.write_bytes(b"a")
+    queue.store.update(v.id or 0, media_status="done", media_path=str(f))
+    read = queue.mark_read(v.id or 0).paper
+    assert not f.exists() and (read.media_mode, read.media_status, read.media_path) == ("audio", None, None)
+    kicks.clear()
+    back = queue.mark_read(v.id or 0, read=False).paper
+    assert back.media_status == "pending" and len(kicks) == 1
+    queue.remove(v.id or 0)
+    revived = queue.add(WATCH).paper
+    assert (revived.status, revived.media_mode, revived.media_status) == ("to_read", "link", None)
+
+
+def test_oembed_fallback_is_completed_later(
+    queue: PaperQueue, ytdlp: FakeYtDlp, router: Router, cfg: Config
+) -> None:
+    info = ytdlp.info.pop(VIDEO_ID)
+    router.json("www.youtube.com", "/oembed", {"title": "How Transformers Work", "author_name": "Some Channel"})
+    v = queue.add(WATCH, when="next").paper
+    assert (v.needs_metadata, v.duration_seconds, v.duration_minutes) == (True, None, cfg.schedule.duration_minutes)
+    ytdlp.info[VIDEO_ID] = info
+    queue.maintain()
+    fixed = queue.get(v.id or 0)
+    assert (fixed.needs_metadata, fixed.duration_seconds) == (False, 2520)
+    assert fixed.abstract and fixed.year == 2024
+
+
+def test_videos_are_not_pushed_to_the_library(lib_queue: PaperQueue, ytdlp: FakeYtDlp, library: FakeLibrary) -> None:
+    lib_queue.add(WATCH)
+    assert lib_queue.sync_library().pushed == 0
+    assert library.pushed == []
+
+
+def test_status_media(queue: PaperQueue, ytdlp: FakeYtDlp, monkeypatch) -> None:
+    v = queue.add(WATCH, media="audio").paper
+    other = queue.add("https://youtu.be/abcdefghijk", media="audio").paper
+    queue.store.update(other.id or 0, media_status="failed", media_error="bot_check")
+    m = queue.status()["media"]
+    assert (m["default_mode"], m["deno"], m["ffmpeg"], m["pending"]) == ("link", True, True, 1)
+    assert m["failed"] == [{"id": other.id, "title": other.title, "error": "bot_check",
+                            "fix": service.mediacache.FIXES["bot_check"]}]
+    assert v.id != other.id

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import re
 import sqlite3
@@ -57,6 +58,17 @@ MIGRATIONS: list[str] = [
     CREATE INDEX ix_papers_url_key ON papers(url_key) WHERE url_key IS NOT NULL;
     CREATE INDEX ix_papers_title_key ON papers(title_key) WHERE title_key IS NOT NULL;
     CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+    """,
+    # 2: YouTube videos share the table (kind = 'video'), deduplicated by video_id
+    """
+    ALTER TABLE papers ADD COLUMN kind TEXT NOT NULL DEFAULT 'paper';
+    ALTER TABLE papers ADD COLUMN video_id TEXT;
+    ALTER TABLE papers ADD COLUMN media_mode TEXT NOT NULL DEFAULT 'link';
+    ALTER TABLE papers ADD COLUMN media_path TEXT;
+    ALTER TABLE papers ADD COLUMN media_status TEXT;
+    ALTER TABLE papers ADD COLUMN media_error TEXT;
+    ALTER TABLE papers ADD COLUMN duration_seconds INTEGER;
+    CREATE UNIQUE INDEX ux_papers_video ON papers(video_id) WHERE video_id IS NOT NULL;
     """,
 ]
 
@@ -142,6 +154,13 @@ class Paper:
     read_at: str | None = None
     pdf_path: str | None = None
     needs_metadata: bool = False
+    kind: str = "paper"  # paper | video
+    video_id: str | None = None
+    media_mode: str = "link"  # link | audio | video
+    media_path: str | None = None
+    media_status: str | None = None  # None | pending | downloading | done | failed
+    media_error: str | None = None  # a mediacache.FIXES code
+    duration_seconds: int | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Paper:
@@ -171,7 +190,7 @@ class Paper:
         tz = tz or UTC
         now = now or utcnow()
         d = asdict(self)
-        for internal in ("calendar_uid", "calendar_hash", "pdf_path"):
+        for internal in ("calendar_uid", "calendar_hash", "pdf_path", "media_path"):
             d.pop(internal)
         end = self.end
         d["scheduled_end"] = to_iso(end) if end else None
@@ -182,6 +201,7 @@ class Paper:
         d["scheduled"] = self.scheduled_start is not None
         d["missed"] = self.is_missed(now)
         d["has_pdf"] = bool(self.pdf_path and Path(self.pdf_path).is_file())
+        d["has_media"] = bool(self.media_path and Path(self.media_path).is_file())
         return d
 
 
@@ -318,6 +338,7 @@ class Store:
     def find_duplicate(
         self,
         *,
+        video_id: str | None = None,
         doi: str | None = None,
         arxiv_id: str | None = None,
         library: str | None = None,
@@ -325,9 +346,12 @@ class Store:
         url: str | None = None,
         title: str | None = None,
     ) -> Paper | None:
-        """First match by DOI, arXiv ID, (library, key), normalised URL, then title.
-        Includes tombstoned (removed) papers so they are not re-created."""
+        """First match by video ID, DOI, arXiv ID, (library, key), normalised URL, then title.
+        Includes tombstoned (removed) papers so they are not re-created. Videos are never
+        matched by title: many share one ("Lecture 1")."""
         checks: list[tuple[str, list[Any]]] = []
+        if video_id:
+            checks.append(("video_id = ?", [video_id]))
         if doi:
             checks.append(("lower(doi) = lower(?)", [doi]))
         if arxiv_id:
@@ -336,10 +360,10 @@ class Store:
             checks.append(("library = ? AND library_key = ?", [library, library_key]))
         if key := url_key(url):
             checks.append(("url_key = ?", [key]))
-        if key := title_key(title):
+        if not video_id and (key := title_key(title)):
             # Same title but a different DOI is a different work (e.g. erratum, reply).
             checks.append(
-                ("title_key = ? AND (doi IS NULL OR ? IS NULL OR lower(doi) = lower(?))",
+                ("title_key = ? AND kind = 'paper' AND (doi IS NULL OR ? IS NULL OR lower(doi) = lower(?))",
                  [key, doi, doi])
             )
         with self._connect() as con:
@@ -391,6 +415,17 @@ class Store:
         sql = f"SELECT * FROM papers WHERE {' AND '.join(clauses)} ORDER BY {ORDERS[order]}"
         with self._connect() as con:
             rows = con.execute(sql, params).fetchall()
+        return [Paper.from_row(r) for r in rows]
+
+    def list_media_pending(self) -> builtins.list[Paper]:
+        """Unwatched videos whose audio/video copy is not downloaded yet (incl. failed ones),
+        scheduled ones first."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM papers WHERE status = 'to_read' AND media_mode IN ('audio', 'video') "
+                "AND (media_status IS NULL OR media_status != 'done') "
+                "ORDER BY scheduled_start IS NULL, scheduled_start, priority, id"
+            ).fetchall()
         return [Paper.from_row(r) for r in rows]
 
     def counts(self, now: datetime | None = None) -> dict[str, int]:

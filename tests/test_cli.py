@@ -31,6 +31,7 @@ CONFIG = (
     '[mendeley]\nclient_id = "abc"\nclient_secret = "men-SECRET-3"\n'
     '[calendar]\nbackend = "off"\n'
     '[pdf]\nenabled = false\n'
+    '[media]\ndir = "/nonexistent/paperqueue-test/Media"\n'
 )
 
 
@@ -186,7 +187,8 @@ def test_skill_frontmatter():
     assert SKILL_MD.startswith("---\nname: paper-queue\n")
     front = SKILL_MD.split("---")[1]
     assert "description:" in front and "save for later" in front
-    for tool in ("add_paper", "upcoming", "mark_read", "remove_paper"):
+    assert "YouTube" in front and "watch" in front
+    for tool in ("add_paper", "upcoming", "mark_read", "remove_paper", "set_media"):
         assert tool in SKILL_MD
 
 
@@ -270,3 +272,64 @@ def test_serve_no_maintenance(home, monkeypatch, capsys):
     assert cli.main(["serve", "--no-maintenance"]) == 0
     assert seen["host"] == "127.0.0.1"
     assert "?token=" not in capsys.readouterr().out
+
+
+def test_youtube_commands(queue, ytdlp, kicks, capsys):
+    assert cli.main(["add", "https://youtu.be/dQw4w9WgXcQ", "--media", "audio", "-w", "none"]) == 0
+    assert "Added #1 How Transformers Work" in capsys.readouterr().out
+    assert queue.get(1).media_mode == "audio" and len(kicks) == 1
+    assert cli.main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "YouTube · 42 min · Some Channel" in out and "audio pending" in out
+    assert cli.main(["media", "1", "link"]) == 0
+    assert "Link only: #1" in capsys.readouterr().out
+    assert queue.get(1).media_mode == "link"
+    with pytest.raises(SystemExit):
+        cli.main(["media", "1", "mp3"])
+    assert cli.main(["add", "1706.03762", "--media", "audio"]) == 1
+    assert "YouTube links only" in capsys.readouterr().err
+
+
+def test_media_worker_is_hidden_and_runs_worker(home, monkeypatch, capsys):
+    from paperqueue import mediacache
+
+    ran = []
+    monkeypatch.setattr(mediacache, "worker", lambda queue: ran.append(queue) or 0)
+    assert cli.main(["media-worker"]) == 0
+    assert len(ran) == 1
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    assert "media-worker" not in capsys.readouterr().out
+
+
+def test_doctor_youtube_checks(home, monkeypatch, capsys):
+    import yt_dlp.version
+
+    from paperqueue import metadata
+
+    monkeypatch.setattr(yt_dlp.version, "__version__", "2020.01.01")
+    monkeypatch.setattr(metadata, "find_tool", lambda name: None)
+    assert cli.main(["doctor"]) == 0  # links-only default: missing tools are warnings
+    out = capsys.readouterr().out
+    assert "[warn] yt-dlp: 2020.01.01" in out and "fix: YouTube changes often" in out
+    assert "uv tool upgrade paperqueue" in out
+    assert "[warn] deno" in out and "fix: brew install deno" in out
+    assert "[warn] ffmpeg" in out and "fix: brew install ffmpeg" in out
+
+    (home / "config.toml").write_text(CONFIG.replace('[media]\n', '[media]\ndefault_mode = "video"\n'))
+    assert cli.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] deno" in out and "[FAIL] ffmpeg" in out
+
+
+def test_doctor_lists_failed_downloads(queue, ytdlp, monkeypatch, capsys):
+    from paperqueue import metadata
+
+    queue.add("https://youtu.be/dQw4w9WgXcQ", media="audio", when="none")
+    queue.store.update(1, media_status="failed", media_error="bot_check")
+    monkeypatch.setattr(metadata, "find_tool", lambda name: f"/opt/homebrew/bin/{name}")
+    cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "[ok] deno: /opt/homebrew/bin/deno" in out
+    assert "[warn] Download #1: How Transformers Work (bot_check)" in out
+    assert "cookies_from_browser" in out
