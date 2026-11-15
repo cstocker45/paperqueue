@@ -206,6 +206,14 @@ def test_push_failure_is_a_warning(lib_queue: PaperQueue, papers: Router, librar
     assert lib_queue.status()["library"]["ok"] is False
 
 
+def test_unresolved_metadata_is_not_pushed(lib_queue: PaperQueue, papers: Router, library: FakeLibrary) -> None:
+    p = lib_queue.add("2502.09775").paper
+    library.pushed.clear()
+    lib_queue.store.update(p.id or 0, library=None, library_key=None, needs_metadata=True)
+    assert lib_queue.sync_library().pushed == 0
+    assert library.pushed == []
+
+
 def test_library_source_is_not_pushed_back(lib_queue: PaperQueue, papers: Router, library: FakeLibrary) -> None:
     lib_queue.add("2502.09775", source="zotero")
     assert library.pushed == []
@@ -473,8 +481,10 @@ def test_status(queue: PaperQueue, papers: Router, calendar: FakeCalendar, cfg: 
     s = queue.status()
     assert set(s) == {"rev", "counts", "library", "calendar", "pdf", "media", "schedule", "lan"}
     assert set(s["library"]) == {"provider", "ok", "message", "can_write", "last_sync"}
-    assert set(s["calendar"]) == {"backend", "name", "ok", "message"}
+    assert set(s["calendar"]) == {"backend", "name", "alert_minutes", "ok", "message"}
     assert s["calendar"]["ok"] is True and s["library"]["provider"] == "off"
+    assert s["calendar"]["alert_minutes"] == cfg.calendar.alert_minutes
+    assert s["media"]["bytes"] == 0 and s["media"]["files"] == 0
     assert s["counts"]["scheduled"] == 1
     assert s["schedule"] == {"days": ["mon", "tue", "wed", "thu", "fri"], "times": ["08:30"],
                              "duration_minutes": 45, "max_session_minutes": 90, "timezone": "Europe/Berlin"}
@@ -660,3 +670,71 @@ def test_status_media(queue: PaperQueue, ytdlp: FakeYtDlp, monkeypatch) -> None:
     assert m["failed"] == [{"id": other.id, "title": other.title, "error": "bot_check",
                             "fix": service.mediacache.FIXES["bot_check"]}]
     assert v.id != other.id
+
+
+# --- pending pushes (library closed) and backfill -----------------------------------------------
+
+
+def test_push_while_library_closed_is_pending(
+    lib_queue: PaperQueue, papers: Router, library: FakeLibrary, clock: Clock
+) -> None:
+    library.closed = True
+    r = lib_queue.add("2502.09775", tags=["t"])
+    assert r.created and r.paper.library_key is None
+    assert r.warnings == ["zotero: Zotero is not open; the paper will be added to Zotero when it is open"]
+    assert lib_queue.status()["library"]["ok"] is True  # a closed app is not a failure
+    lib_queue.maintain()  # still closed: nothing pushed, and no attempt used up
+    assert library.pushed == []
+    library.closed = False
+    lib_queue.maintain()
+    assert lib_queue.get(r.paper.id or 0).library_key == "KEY1"
+    assert library.pushed[0][1] == ["t"]
+    lib_queue.maintain()
+    assert len(library.pushed) == 1
+
+
+def test_backfill_is_rate_limited_in_the_background(
+    lib_queue: PaperQueue, papers: Router, library: FakeLibrary, cfg: Config, clock: Clock
+) -> None:
+    cfg.zotero.push_new_papers = False
+    old = [lib_queue.add(ref).paper for ref in ("2502.09775", "2401.00001")]
+    lib_queue.mark_read(old[1].id or 0)
+    cfg.zotero.push_new_papers = True
+    library.fail_push = True
+    lib_queue.maintain()
+    lib_queue.maintain()  # failed an hour ago? no: just now, so not retried yet
+    library.fail_push = False
+    lib_queue.maintain()
+    assert library.pushed == []
+    clock.now += timedelta(hours=2)
+    lib_queue.maintain()
+    # Only the queued (unread) paper is backfilled.
+    assert [m.arxiv_id for m, _ in library.pushed] == ["2502.09775"]
+    assert lib_queue.get(old[0].id or 0).library_key == "KEY1"
+    assert lib_queue.get(old[1].id or 0).library_key is None
+
+
+def test_pull_after_push_does_not_duplicate(
+    queue: PaperQueue, papers: Router, cfg: Config, tmp_path: Path
+) -> None:
+    from paperqueue.libraries.zotero import ZoteroProvider
+
+    from .test_zotero import FakeZotero
+
+    zot = FakeZotero()
+    cfg.library.provider = "zotero"
+    provider = ZoteroProvider(cfg, client=httpx.Client(transport=httpx.MockTransport(zot)))
+    provider._sleep = lambda s: None
+    queue._library, queue._library_loaded = provider, True
+    zot.running = False
+    r = queue.add("2502.09775", tags=["t"])
+    assert r.paper.library_key is None and "will be added to Zotero when it is open" in r.warnings[0]
+    zot.running = True
+    sync = queue.sync_library()
+    assert (sync.pulled, sync.created, sync.pushed) == (0, 0, 1)
+    sync = queue.sync_library()
+    assert (sync.pulled, sync.created, sync.pushed) == (1, 0, 0)
+    [paper] = queue.list("all")
+    assert paper.library_key == "NEW0" and paper.tags == ["t"]
+    assert len(zot.calls("saveItems")) == 1
+    assert json.loads(zot.calls("updateSession")[0].content)["tags"] == ["t", "paperqueue"]

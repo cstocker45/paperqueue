@@ -29,6 +29,7 @@ from .types import (
     CalendarBackend,
     EventSpec,
     LibraryProvider,
+    LibraryUnavailable,
     OpResult,
     SyncResult,
     event_marker,
@@ -613,18 +614,53 @@ class PaperQueue:
 
     def _push(self, paper: Paper) -> tuple[bool, builtins.list[str]]:
         """Create the paper in the reference manager, if configured to. Returns (pushed, warnings)."""
+        outcome, warnings = self._push_outcome(paper)
+        return outcome == "pushed", warnings
+
+    def _push_outcome(self, paper: Paper) -> tuple[str, builtins.list[str]]:
+        """Push one paper: "pushed", "skipped", "unavailable" (library closed; retried later) or "failed"."""
         provider = self.library
         if provider is None or paper.library_key or paper.kind != "paper" or not self._push_enabled(provider):
-            return False, []
+            return "skipped", []
+        if paper.needs_metadata:  # don't put a half-resolved record (e.g. a bare URL as title) into the library
+            return "skipped", []
         assert paper.id is not None
         try:
             key = provider.push(_meta_of(paper), paper.tags)
             if key:
                 self.store.update(paper.id, library=provider.name, library_key=key)
+        except LibraryUnavailable:
+            label = provider.name.capitalize()
+            return "unavailable", [f"{provider.name}: {label} is not open; the paper will be added to {label} "
+                                   "when it is open"]
         except Exception as exc:  # provider failures are warnings, never errors
             self._note_failure("library", f"{provider.name}: {exc}")
-            return False, [f"{provider.name}: could not add to library: {exc}"]
-        return bool(key), []
+            return "failed", [f"{provider.name}: could not add to library: {exc}"]
+        return ("pushed" if key else "skipped"), []
+
+    def _push_pending(self, result: SyncResult, rate_limited: bool) -> bool:
+        """Push (or backfill) queued papers that belong in the library but have no key yet.
+        Background retries are rate-limited per paper; a closed library costs no attempt."""
+        provider = self.library
+        if provider is None or not self._push_enabled(provider):
+            return False
+        now = self._now()
+        changed = False
+        for paper in self.store.list(status="to_read"):
+            assert paper.id is not None
+            if paper.library_key is not None or paper.source in LIBRARY_SOURCES or paper.kind != "paper":
+                continue
+            if rate_limited and not self._due("push", paper.id, now):
+                continue
+            outcome, warnings = self._push_outcome(paper)
+            result.warnings += warnings
+            if outcome == "unavailable":
+                self._attempts.pop(("push", paper.id), None)
+                break  # the rest would fail the same way
+            if outcome == "pushed":
+                result.pushed += 1
+                changed = True
+        return changed
 
     def update(
         self,
@@ -804,7 +840,9 @@ class PaperQueue:
 
     # library --------------------------------------------------------------
 
-    def sync_library(self) -> SyncResult:
+    def sync_library(self, rate_limited: bool = False) -> SyncResult:
+        """Pull the library's "To read" items, then push queued papers it lacks (`rate_limited`
+        spaces out the retries of a paper, for the background loop)."""
         provider = self.library
         result = SyncResult()
         if provider is None:
@@ -858,14 +896,8 @@ class PaperQueue:
                         self.store.update(dup.id, **changes)
                         changed = True
 
-        if self._push_enabled(provider):
-            for paper in self.store.list(status="to_read"):
-                if paper.library_key is None and paper.source not in LIBRARY_SOURCES and paper.kind == "paper":
-                    pushed, push_warnings = self._push(paper)
-                    result.warnings += push_warnings
-                    if pushed:
-                        result.pushed += 1
-                        changed = True
+        if self._push_pending(result, rate_limited):
+            changed = True
         self.store.set_meta("library_last_sync", to_iso(self._now()))
         if changed:
             self.store.bump_rev()
@@ -987,7 +1019,7 @@ class PaperQueue:
         """Background upkeep: calendar retry, library pull, metadata retry, PDF cache."""
         steps: builtins.list[tuple[str, Callable[[], SyncResult | builtins.list[str]]]] = [
             ("calendar", self.sync_calendar),
-            ("library", self.sync_library),
+            ("library", lambda: self.sync_library(rate_limited=True)),
             ("metadata", self._retry_metadata),
             ("pdf cache", self.cache_pdfs),
             ("media", self.kick_media),
@@ -1073,6 +1105,21 @@ class PaperQueue:
         self._checks[kind] = (ok, message, now)
         return ok, message
 
+    def _media_usage(self) -> tuple[int, int]:
+        """Total size and number of the downloaded media files that exist on disk."""
+        total = files = 0
+        for paper in self.store.list(status="all"):
+            if not paper.media_path:
+                continue
+            try:
+                path = Path(paper.media_path)
+                if path.is_file():
+                    total += path.stat().st_size
+                    files += 1
+            except OSError:
+                continue
+        return total, files
+
     def status(self) -> dict[str, Any]:
         """Overview for clients. Never contains secrets."""
         lib_ok, lib_msg = self._check("library")
@@ -1080,6 +1127,7 @@ class PaperQueue:
         provider = self.library
         s = self.cfg.schedule
         pending = self.store.list_media_pending()
+        media_bytes, media_files = self._media_usage()
         return {
             "rev": self.store.rev(),
             "counts": self.store.counts(self._now()),
@@ -1093,6 +1141,7 @@ class PaperQueue:
             "calendar": {
                 "backend": self.cfg.calendar.backend,
                 "name": self.cfg.calendar.apple_calendar,
+                "alert_minutes": self.cfg.calendar.alert_minutes,
                 "ok": cal_ok,
                 "message": cal_msg,
             },
@@ -1101,6 +1150,8 @@ class PaperQueue:
                 "default_mode": self.cfg.media.default_mode,
                 "dir": _shown(self.cfg.media.dir),
                 **mediacache.tools(),
+                "bytes": media_bytes,
+                "files": media_files,
                 "pending": sum(p.media_status != "failed" for p in pending),
                 "failed": [
                     {"id": p.id, "title": p.title, "error": p.media_error,

@@ -156,7 +156,11 @@ def test_check_collection_missing(tmp_path):
 
 def test_check_ok(tmp_path):
     ok, msg = make(tmp_path, lambda r: paged(r, [coll("TR", "To read")])).check()
+    assert ok and "read/write (local)" in msg and "local connector" in msg
+    ok, msg = make(tmp_path, lambda r: paged(r, [coll("TR", "To read")]), source="web", user_id="1").check()
     assert ok and "read-only" in msg
+    ok, msg = make(tmp_path, lambda r: paged(r, [coll("TR", "To read")]), user_id="1", api_key="k").check()
+    assert ok and "read/write (web API)" in msg
 
 
 def test_split_name():
@@ -218,9 +222,10 @@ def test_push_not_writable(tmp_path):
     def handler(request):
         raise AssertionError("no request expected")
 
-    p = make(tmp_path, handler)
+    p = make(tmp_path, handler, source="web", user_id="123")
     assert not p.can_write
     assert p.push(PaperMeta(title="T"), []) is None
+    assert make(tmp_path, handler).can_write  # local mode writes through the connector
 
 
 def test_item_link(tmp_path):
@@ -278,3 +283,251 @@ def test_get_provider(tmp_path):
     cfg.library.provider = "endnote"
     with pytest.raises(LibraryError):
         get_provider(cfg, tmp_path)
+
+
+# --- local connector (shapes from Zotero's server_connector.js / saveSession.js) -------------------
+
+TARGETS = {
+    "libraryID": 1, "libraryName": "My Library", "libraryEditable": True, "filesEditable": True,
+    "editable": True, "id": None, "name": "My Library",
+    "targets": [
+        {"id": "L1", "name": "My Library", "filesEditable": True, "level": 0},
+        {"id": "C3", "name": "Other", "filesEditable": True, "level": 1},
+        {"id": "C7", "name": "to READ", "filesEditable": True, "level": 1},
+        {"id": "L2", "name": "Group", "filesEditable": True, "level": 0},
+        {"id": "C9", "name": "To read", "filesEditable": True, "level": 1},
+    ],
+    "tags": {"L1": []},
+}
+PDF_BYTES = b"%PDF-1.7\n" + b"0" * 100
+
+
+class FakeZotero:
+    """Zotero desktop on localhost:23119: the connector endpoints plus the read-only local API."""
+
+    def __init__(self, items=None, targets=TARGETS, running=True):
+        self.items = list(items or [])  # local API item objects
+        self.in_collection: set[str] = {i["key"] for i in self.items}
+        self.targets = targets
+        self.running = running
+        self.requests: list[httpx.Request] = []
+        self.sessions: dict[str, list[dict]] = {}
+        self.attachments: list[tuple[dict, bytes]] = []
+        self.web_calls = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        url = request.url
+        if url.host == "arxiv.org":
+            return httpx.Response(200, content=PDF_BYTES, headers={"content-type": "application/pdf"})
+        if url.host == "api.zotero.org":
+            self.web_calls += 1
+            if request.method == "GET":
+                return paged(request, [coll("WC", "To read")])
+            return httpx.Response(200, json={"successful": {"0": {"key": "WEBKEY", "data": {}}}, "failed": {}})
+        assert url.host == "localhost" and url.port == 23119, url
+        if not self.running:
+            raise httpx.ConnectError("refused", request=request)
+        if url.path.startswith("/connector/"):
+            assert request.headers["X-Zotero-Connector-API-Version"] == "3"
+            assert "origin" not in request.headers
+            assert not request.headers.get("user-agent", "").startswith("Mozilla/")
+            return self.connector(url.path.removeprefix("/connector/"), request)
+        return self.local_api(request)
+
+    def connector(self, name: str, request: httpx.Request) -> httpx.Response:
+        if name == "ping":
+            assert request.method == "GET"
+            return httpx.Response(200, text="<!DOCTYPE html><html><body>Zotero is running</body></html>")
+        if name == "saveAttachment":
+            assert request.headers["Content-Type"] == "application/pdf"
+            meta = json.loads(request.headers["X-Metadata"])
+            assert meta["sessionID"] in self.sessions and request.url.params["sessionID"] == meta["sessionID"]
+            self.attachments.append((meta, request.content))
+            return httpx.Response(201)
+        assert request.method == "POST" and request.headers["Content-Type"] == "application/json"
+        body = json.loads(request.content)
+        if name == "getSelectedCollection":
+            return httpx.Response(200, json=self.targets)
+        if name == "saveItems":
+            if body["sessionID"] in self.sessions:
+                return httpx.Response(409, json={"error": "SESSION_EXISTS"})
+            self.sessions[body["sessionID"]] = []
+            for n, item in enumerate(body["items"]):
+                assert "collections" not in item and item["id"]
+                key = f"NEW{len(self.items) + n}"
+                data = {k: v for k, v in item.items() if k != "id"} | {"key": key, "tags": []}
+                self.items.append({"key": key, "data": data})
+                self.sessions[body["sessionID"]].append(data)
+            return httpx.Response(201, headers={"Content-Type": "application/json"})
+        if name == "updateSession":
+            if body["sessionID"] not in self.sessions:
+                return httpx.Response(400, json={"error": "SESSION_NOT_FOUND"})
+            assert body["target"].startswith("C") and isinstance(body["tags"], list)
+            for data in self.sessions[body["sessionID"]]:
+                data["tags"] = [{"tag": t} for t in body["tags"]]
+                self.in_collection.add(data["key"])
+            self.moved_to = body["target"]
+            return httpx.Response(200, json={})
+        if name == "saveAttachmentFromResolver":
+            return httpx.Response(500, text="Failed to save an attachment")
+        raise AssertionError(f"unexpected connector call {name}")
+
+    def local_api(self, request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET" and str(request.url).startswith(LOCAL_BASE)
+        path = request.url.path.removeprefix("/api/users/0")
+        if path == "/collections":
+            return paged(request, [coll("TR", "To read")])
+        if path == "/collections/TR/items/top":
+            return httpx.Response(200, json=[i for i in self.items if i["key"] in self.in_collection])
+        if path == "/items/top" and "q" not in request.url.params:
+            assert request.url.params["sort"] == "dateAdded" and request.url.params["direction"] == "desc"
+            return httpx.Response(200, json=self.items[::-1][: int(request.url.params["limit"])])
+        if path == "/items/top":
+            q = request.url.params["q"].lower()
+            assert request.url.params["qmode"] == "everything"
+            hits = [i for i in self.items if q in json.dumps(i["data"]).lower()]
+            return httpx.Response(200, json=hits)
+        raise AssertionError(f"unexpected local API call {path}")
+
+    def calls(self, name: str) -> list[httpx.Request]:
+        return [r for r in self.requests if r.url.path == f"/connector/{name}"]
+
+
+def local(tmp_path, zot, **kw):
+    p = make(tmp_path, zot, **kw)
+    p._sleep = lambda s: None
+    return p
+
+
+ARXIV_META = PaperMeta(
+    title="Attention Is All You Need", authors=["Ashish Vaswani", "Noam Shazeer"], year=2017,
+    abstract="The dominant ...", url="https://arxiv.org/abs/1706.03762",
+    pdf_url="https://arxiv.org/pdf/1706.03762", arxiv_id="1706.03762", doi="10.48550/arXiv.1706.03762",
+)
+
+
+def test_local_push_creates_item_and_moves_it(tmp_path):
+    zot = FakeZotero()
+    p = local(tmp_path, zot)
+    key = p.push(ARXIV_META, ["nlp"])
+    assert key == "NEW0"
+    [save] = zot.calls("saveItems")
+    body = json.loads(save.content)
+    [item] = body["items"]
+    assert item["itemType"] == "preprint" and item["repository"] == "arXiv"
+    assert item["archiveID"] == "arXiv:1706.03762" and item["DOI"] == "10.48550/arXiv.1706.03762"
+    assert item["title"] == "Attention Is All You Need" and item["date"] == "2017"
+    assert item["url"] == "https://arxiv.org/abs/1706.03762" and item["abstractNote"] == "The dominant ..."
+    assert item["creators"][0] == {"creatorType": "author", "lastName": "Vaswani", "firstName": "Ashish"}
+    assert "tags" not in item and "collections" not in item
+    [update] = zot.calls("updateSession")
+    upd = json.loads(update.content)
+    # The case-insensitive match in My Library, not the group library's "To read".
+    assert upd == {"sessionID": body["sessionID"], "target": "C7", "tags": ["nlp", "paperqueue"]}
+    [(meta, pdf)] = zot.attachments
+    assert pdf == PDF_BYTES
+    assert meta == {"sessionID": body["sessionID"], "parentItemID": item["id"], "title": "Full Text PDF",
+                    "url": "https://arxiv.org/pdf/1706.03762"}
+    assert zot.calls("saveAttachmentFromResolver") == []
+    assert {r.url.host for r in zot.requests} == {"localhost", "arxiv.org"}
+    # A second push of the same paper adopts the item instead of saving it again.
+    assert p.push(ARXIV_META, []) == "NEW0" and len(zot.calls("saveItems")) == 1
+
+
+def test_local_push_journal_without_pdf_asks_zotero(tmp_path):
+    zot = FakeZotero()
+    meta = PaperMeta(title="A cell atlas of the human body", authors=["Jane Doe"], doi="10.1038/s41586-x",
+                     venue="Nature")
+    assert local(tmp_path, zot).push(meta, []) == "NEW0"
+    item = json.loads(zot.calls("saveItems")[0].content)["items"][0]
+    assert item["itemType"] == "journalArticle" and item["publicationTitle"] == "Nature"
+    [res] = zot.calls("saveAttachmentFromResolver")
+    assert json.loads(res.content) == {"sessionID": json.loads(zot.calls("saveItems")[0].content)["sessionID"],
+                                       "itemID": item["id"]}
+
+
+def test_local_push_dedupes(tmp_path):
+    existing = {"key": "OLD1", "data": {"key": "OLD1", "itemType": "preprint", "title": "Attention is all you need",
+                                        "archiveID": "arXiv:1706.03762v5", "tags": []}}
+    zot = FakeZotero(items=[existing])
+    zot.in_collection = set()  # elsewhere in the library: still the same paper
+    assert local(tmp_path, zot).push(ARXIV_META, []) == "OLD1"
+    assert zot.calls("saveItems") == [] and zot.calls("updateSession") == []
+    by_title = {"key": "OLD2", "data": {"key": "OLD2", "itemType": "journalArticle",
+                                        "title": "A Cell Atlas of the Human Body!", "tags": []}}
+    zot = FakeZotero(items=[by_title])
+    assert local(tmp_path, zot).push(PaperMeta(title="A cell atlas of the human body"), []) == "OLD2"
+    # Same title, different DOI: a different work.
+    by_title["data"]["DOI"] = "10.1/other"
+    zot = FakeZotero(items=[by_title])
+    assert local(tmp_path, zot).push(PaperMeta(title="A cell atlas of the human body", doi="10.1/mine"), []) != "OLD2"
+
+
+def test_local_push_missing_collection(tmp_path):
+    targets = {**TARGETS, "targets": [TARGETS["targets"][0], TARGETS["targets"][1], *TARGETS["targets"][3:]]}
+    zot = FakeZotero(targets=targets)
+    with pytest.raises(LibraryError, match="no collection named 'To read'.*Create it"):
+        local(tmp_path, zot).push(ARXIV_META, [])
+    assert zot.calls("saveItems") == []
+
+
+def test_local_push_zotero_closed(tmp_path):
+    from paperqueue.types import LibraryUnavailable
+
+    zot = FakeZotero(running=False)
+    with pytest.raises(LibraryUnavailable, match="not open"):
+        local(tmp_path, zot).push(ARXIV_META, [])
+
+
+def test_local_push_errors(tmp_path):
+    zot = FakeZotero()
+    zot.connector = lambda name, req: (
+        httpx.Response(200, text="ok") if name == "ping"
+        else httpx.Response(200, json=TARGETS) if name == "getSelectedCollection"
+        else httpx.Response(500, json={"libraryEditable": False})
+    )
+    with pytest.raises(LibraryError, match="read-only"):
+        local(tmp_path, zot).push(ARXIV_META, [])
+
+
+def test_local_push_key_not_found(tmp_path):
+    zot = FakeZotero()
+    zot.local_api = lambda request: httpx.Response(200, json=[]) if "items" in request.url.path else paged(
+        request, [coll("TR", "To read")])
+    p = local(tmp_path, zot)
+    import paperqueue.libraries.zotero as z
+
+    z_wait = z.KEY_WAIT_S
+    z.KEY_WAIT_S = 0.0
+    try:
+        with pytest.raises(LibraryError, match="linked on the next sync"):
+            p.push(ARXIV_META, [])
+    finally:
+        z.KEY_WAIT_S = z_wait
+    assert len(zot.calls("saveItems")) == 1
+
+
+def test_web_push_takes_precedence(tmp_path):
+    zot = FakeZotero()
+    p = local(tmp_path, zot, user_id="123", api_key="k")
+    assert p.push(ARXIV_META, []) == "WEBKEY"
+    assert zot.web_calls == 2 and not any(r.url.path.startswith("/connector/") for r in zot.requests)
+
+
+def test_pull_hides_push_tag(tmp_path):
+    zot = FakeZotero()
+    p = local(tmp_path, zot)
+    key = p.push(ARXIV_META, ["nlp"])
+    [item] = p.pull()
+    assert item.key == key and item.tags == ["nlp"]
+
+
+def test_local_push_short_title_without_ids_is_not_duplicated(tmp_path):
+    zot = FakeZotero(items=[{"key": "X1", "data": {"key": "X1", "itemType": "journalArticle",
+                                                   "title": "Deep learning", "DOI": "10.1/other"}}])
+    p = local(tmp_path, zot)
+    meta = PaperMeta(title="Deep learning", authors=["Y LeCun"])
+    key = p.push(meta, [])
+    assert key == "NEW1"  # the new item, not the same-titled one with a DOI
+    assert p.push(meta, []) == "NEW1" and len(zot.calls("saveItems")) == 1

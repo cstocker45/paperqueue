@@ -24,11 +24,21 @@ TEST_CLIENTS = ["testclient"]  # ...and client address
 
 
 class FakePaper:
-    def __init__(self, id: int, title: str = "A paper", pdf_path: str | None = None, media_path: str | None = None):
+    def __init__(
+        self,
+        id: int,
+        title: str = "A paper",
+        pdf_path: str | None = None,
+        media_path: str | None = None,
+        url: str | None = None,
+        pdf_url: str | None = None,
+    ):
         self.id = id
         self.title = title
         self.pdf_path = pdf_path
         self.media_path = media_path
+        self.url = url
+        self.pdf_url = pdf_url
 
     def to_dict(self, tz=None):
         return {"id": self.id, "title": self.title, "has_pdf": bool(self.pdf_path)}
@@ -196,6 +206,102 @@ def test_qr_only_with_lan():
     assert b"<svg" in r.content
 
 
+# --------------------------------------------------------------------------- per-item QR
+
+
+@pytest.fixture
+def qr_payloads(monkeypatch):
+    """Record what each generated QR code encodes."""
+    import segno
+
+    seen: list[str] = []
+    real = segno.make
+
+    def spy(content, *a, **k):
+        seen.append(content)
+        return real(content, *a, **k)
+
+    monkeypatch.setattr(segno, "make", spy)
+    return seen
+
+
+def qr_queue():
+    q = FakeQueue()
+    q.papers = {
+        1: FakePaper(1, url="https://arxiv.org/abs/2502.09775", pdf_url="https://arxiv.org/pdf/2502.09775"),
+        2: FakePaper(2, url="https://www.youtube.com/watch?v=aircAruvnKk"),
+        3: FakePaper(3, url="javascript:alert(1)", pdf_url="file:///etc/passwd"),
+        4: FakePaper(4, url="http://localhost:8765/?token=x", pdf_url="http://127.0.0.1/a.pdf"),
+        5: FakePaper(5, url="ftp://example.org/paper.pdf", pdf_url="  "),
+        6: FakePaper(6, url=f"https://example.org/?k={TOKEN}"),
+        7: FakePaper(7, url="https://user:pw@example.org/paper"),
+        8: FakePaper(8),
+    }
+    return q
+
+
+@pytest.mark.parametrize("lan", [False, True])
+def test_item_qr_encodes_the_stored_public_link_only(qr_payloads, lan):
+    c = client_for(qr_queue(), lan=lan)
+    r = c.get("/api/papers/1/qr.svg")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("image/svg+xml")
+    assert r.headers["cache-control"] == "no-store"
+    assert b"<svg" in r.content and TOKEN.encode() not in r.content
+    r = c.get("/api/papers/1/qr.svg?target=pdf")
+    assert r.status_code == 200
+    r = c.get("/api/papers/2/qr.svg?target=url")
+    assert r.status_code == 200
+    assert qr_payloads == [
+        "https://arxiv.org/abs/2502.09775",
+        "https://arxiv.org/pdf/2502.09775",
+        "https://www.youtube.com/watch?v=aircAruvnKk",
+    ]
+    for payload in qr_payloads:
+        assert TOKEN not in payload and "localhost" not in payload and "token" not in payload
+
+
+def test_item_qr_is_dark_on_light_with_a_quiet_zone():
+    svg = client_for(qr_queue()).get("/api/papers/1/qr.svg").text
+    assert 'stroke="#000"' in svg or "#000000" in svg or 'stroke="#000000"' in svg
+    assert "#fff" in svg  # light background, not transparent
+
+
+@pytest.mark.parametrize(
+    ("pid", "target"),
+    [(3, "url"), (3, "pdf"), (4, "url"), (4, "pdf"), (5, "url"), (5, "pdf"), (6, "url"), (7, "url"),
+     (8, "url"), (8, "pdf"), (2, "pdf")],
+)
+def test_item_qr_refuses_non_public_or_missing_links(qr_payloads, pid, target):
+    r = client_for(qr_queue()).get(f"/api/papers/{pid}/qr.svg?target={target}")
+    assert r.status_code == 400, (pid, target)
+    assert "detail" in r.json()
+    assert qr_payloads == []
+
+
+def test_item_qr_unknown_item_and_bad_target():
+    c = client_for(qr_queue())
+    assert c.get("/api/papers/999/qr.svg").status_code == 404
+    assert c.get("/api/papers/1/qr.svg?target=lan").status_code == 400
+    assert c.get("/api/papers/1/qr.svg?target=").status_code == 400
+
+
+def test_item_qr_needs_token_for_remote_clients():
+    c = client_for(qr_queue(), local=False, lan=True)
+    assert c.get("/api/papers/1/qr.svg").status_code == 401
+    r = c.get("/api/papers/1/qr.svg", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 200 and TOKEN.encode() not in r.content
+
+
+def test_manifest_colours_follow_theme():
+    c = client_for(FakeQueue())
+    light = c.get("/manifest.webmanifest").json()
+    dark = c.get("/manifest.webmanifest?theme=dark").json()
+    assert light["theme_color"] == light["background_color"] == "#f4f7f5"
+    assert dark["theme_color"] == dark["background_color"] == "#0b0d0c"
+    assert c.get("/manifest.webmanifest?theme=nope").json()["theme_color"] == "#f4f7f5"
+
+
 def test_status_reports_lan_without_token():
     st = client_for(FakeQueue(), lan=True).get("/api/status").json()
     assert st["lan"]["enabled"] is True
@@ -359,7 +465,24 @@ def test_status(c):
     for key in ("rev", "counts", "library", "calendar", "pdf", "schedule", "lan"):
         assert key in st, key
     assert st["lan"] == {"enabled": False, "urls": []}
+    assert st["server"]["version"]
+    assert st["media"]["bytes"] == 0 and st["media"]["files"] == 0
+    assert st["calendar"]["alert_minutes"] == 10
     assert TOKEN not in json.dumps(st)
+
+
+def test_status_media_bytes_counts_existing_files(c, queue, tmp_path):
+    p = add(c, "1706.03762", when="none")["paper"]
+    media = tmp_path / "Media"
+    media.mkdir(exist_ok=True)
+    f = media / "Talk [abcdefghijk].m4a"
+    f.write_bytes(b"x" * 1234)
+    queue.store.update(p["id"], media_path=str(f))
+    st = c.get("/api/status").json()
+    assert st["media"]["bytes"] == 1234 and st["media"]["files"] == 1
+    assert c.get(f"/api/papers/{p['id']}").json()["media_bytes"] == 1234
+    f.unlink()
+    assert c.get("/api/status").json()["media"]["bytes"] == 0
 
 
 def test_crud_flow(c):

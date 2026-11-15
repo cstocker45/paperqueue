@@ -108,3 +108,7 @@ class CalendarError(Exception):
 
 class LibraryError(Exception):
     pass
+
+
+class LibraryUnavailable(LibraryError):
+    """The library cannot be written right now (e.g. Zotero desktop is closed); retry later."""

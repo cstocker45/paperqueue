@@ -24,8 +24,8 @@ Everything runs on your Mac. There is no account and no cloud service.
 - **YouTube videos** in the same queue, with a session as long as the video. Keep just the
   link, or (opt-in) download the audio or video to iCloud Drive for offline use.
 - **A Chrome bookmarklet** that saves the paper you are looking at.
-- **Zotero or Mendeley sync** (optional). The app pulls your "To read" collection and can push
-  papers you add back into it.
+- **Zotero or Mendeley sync** (optional). The app pulls your "To read" collection and adds
+  papers you queue here back into it. With Zotero this is local, two-way and needs no account.
 - **Agents.** An MCP server and a Claude Code skill let Claude (or any MCP client) queue papers
   you mention in a chat: "save this for later" just works.
 
@@ -177,11 +177,21 @@ yt-dlp uses your signed-in browser session, then choose the mode again.
 
 1. Install Zotero 7 and enable **Settings > Advanced > Allow other applications on this computer
    to communicate with Zotero** (the local API). Zotero must be running when paperqueue syncs.
-2. Create a collection named **To read**, or set `collection` under `[zotero]`.
+2. Create a collection named **To read** in My Library, or set `collection` under `[zotero]`.
 3. Set `provider = "zotero"` under `[library]`.
-4. To write back as well, so that papers you add here reach Zotero on your iPhone, create a key
-   at <https://www.zotero.org/settings/keys> with write access. Then set `user_id` and `api_key`
-   under `[zotero]`, or the `ZOTERO_USER_ID` and `ZOTERO_API_KEY` environment variables.
+
+Sync is two-way and local, with no Zotero account or API key. paperqueue reads the collection
+through the local API. Papers you add here (pasted links, the CLI or agents) are written into it
+through the same local connector the Zotero browser extension uses, tagged `paperqueue`, and
+Zotero attaches the open-access PDF. Papers already in your library are linked, not duplicated.
+Zotero must be open for this. A paper added while it is closed is saved here with a note and
+added to Zotero once it is open again; existing queued papers are backfilled the same way. Each
+save selects the **To read** collection and the new item in the Zotero window. YouTube videos
+stay in paperqueue only.
+
+If you would rather write through the Zotero web API, create a key at
+<https://www.zotero.org/settings/keys> with write access, and set `user_id` and `api_key` under
+`[zotero]` (or `ZOTERO_USER_ID` and `ZOTERO_API_KEY`). The web API is then used for writes.
 
 Sync runs in the background while `serve` is running, or on demand with `paperqueue sync`.
 Papers are never deleted from Zotero.
@@ -310,7 +320,7 @@ in local time, or `none`.
 | `[library]` | `provider` | `"off"` | `"zotero"`, `"mendeley"` or `"off"` |
 | `[zotero]` | `source` | `"local"` | `"local"` (Zotero 7 desktop) or `"web"` |
 | | `collection` | `"To read"` | |
-| | `user_id`, `api_key` | empty | Web API key, needed to write back |
+| | `user_id`, `api_key` | empty | Optional web API key; writes go through the local connector without one |
 | | `push_new_papers` | `true` | Add papers you queue here to Zotero |
 | `[mendeley]` | `client_id`, `client_secret` | empty | From dev.mendeley.com |
 | | `folder`, `push_new_papers`, `redirect_port` | `"To read"`, `true`, `8766` | |

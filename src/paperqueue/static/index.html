@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#151515" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f4f7f5" media="(prefers-color-scheme: light)" data-scheme="light">
+  <meta name="theme-color" content="#0b0d0c" media="(prefers-color-scheme: dark)" data-scheme="dark">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Papers">
@@ -14,154 +14,198 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <link rel="preload" href="/static/fonts/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/theme.js"></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <a class="skip" href="#list">Skip to papers</a>
-  <div class="page">
-    <header class="masthead">
-      <h1 class="wordmark"><a href="/">paperqueue</a></h1>
-      <p class="summary" id="summary" aria-live="polite"></p>
+  <a class="skip" href="#list">Skip to the list</a>
+  <div class="shell">
+    <header class="top">
+      <div class="brand">
+        <h1 class="wordmark"><a href="/">PAPERQUEUE</a></h1>
+        <span class="version" id="version"></span>
+      </div>
+      <div class="top-right">
+        <span class="clock" id="clock"></span>
+        <span class="syncing" id="syncing" hidden><span class="ink spin" aria-hidden="true">[ / ]</span> <span id="syncing-text">SYNCING</span></span>
+      </div>
+      <span class="phone-count" id="phone-count" aria-live="polite"></span>
     </header>
 
+    <div class="viewrow">
+      <nav class="tabs" aria-label="Views">
+        <button class="tab" type="button" data-view="upcoming" aria-pressed="true">UPCOMING<span class="tab-count" data-count="upcoming"></span></button>
+        <button class="tab" type="button" data-view="queue" aria-pressed="false">QUEUE<span class="tab-count" data-count="queue"></span></button>
+        <button class="tab" type="button" data-view="media" aria-pressed="false">MEDIA<span class="tab-count" data-count="media"></span></button>
+        <button class="tab" type="button" data-view="read" aria-pressed="false">READ<span class="tab-count" data-count="read"></span></button>
+      </nav>
+      <span class="grow"></span>
+      <button class="chip chip-filter" id="tag-clear" type="button" hidden></button>
+      <label class="search">
+        <span class="ink" aria-hidden="true">/</span>
+        <span class="visually-hidden">Search</span>
+        <input id="search" type="search" placeholder="search_" spellcheck="false" autocomplete="off">
+      </label>
+    </div>
+
     <form class="addbar" id="add-form" autocomplete="off">
-      <label class="visually-hidden" for="add-ref">Add a paper</label>
-      <input class="addbar-input" id="add-ref" name="ref" type="text" required
-             placeholder="Paste a paper or YouTube link" title="arXiv ID, DOI, paper URL, title or YouTube link" spellcheck="false">
-      <div class="addbar-options">
-        <label class="inline-field">
-          <span class="inline-label">Priority</span>
-          <select id="add-priority" name="priority">
-            <option value="1">High</option>
-            <option value="2" selected>Normal</option>
-            <option value="3">Low</option>
+      <label class="add-line">
+        <span class="prompt ink" aria-hidden="true">&gt;</span>
+        <span class="visually-hidden">Paper or YouTube link</span>
+        <input class="add-input" id="add-ref" name="ref" type="text" required spellcheck="false"
+               placeholder="paste a paper or youtube link_" title="arXiv ID, DOI, paper URL, title or YouTube link">
+        <button class="cta cta-phone" type="submit">ADD</button>
+      </label>
+      <div class="add-options">
+        <label class="opt">PRIORITY
+          <select class="select" id="add-priority" name="priority">
+            <option value="2" selected>NORMAL</option>
+            <option value="1">HIGH</option>
+            <option value="3">LOW</option>
           </select>
         </label>
-        <label class="inline-field">
-          <span class="inline-label">Schedule</span>
-          <select id="add-when" name="when">
-            <option value="next" selected>Next free slot</option>
-            <option value="none">None</option>
+        <label class="opt">SCHEDULE
+          <select class="select" id="add-when" name="when">
+            <option value="next" selected>NEXT FREE SLOT</option>
+            <option value="today">TODAY</option>
+            <option value="tomorrow">TOMORROW</option>
+            <option value="none">DON'T SCHEDULE</option>
           </select>
         </label>
-        <label class="inline-field" id="add-media-field" hidden>
-          <span class="inline-label">Keep</span>
-          <select id="add-media" name="media">
-            <option value="link">Link only</option>
-            <option value="audio">Audio download</option>
-            <option value="video">Video download</option>
-          </select>
-        </label>
-        <button class="button button-primary" id="add-submit" type="submit">Add</button>
+        <span class="opt" id="add-media-field" hidden>YOUTUBE · KEEP AS
+          <span class="seg" role="group" aria-label="Keep the YouTube video as" id="add-media">
+            <button type="button" data-mode="link" aria-pressed="true">LINK</button>
+            <button type="button" data-mode="audio" aria-pressed="false">AUDIO</button>
+            <button type="button" data-mode="video" aria-pressed="false">VIDEO</button>
+          </span>
+        </span>
+        <span class="grow"></span>
+        <button class="cta" id="add-submit" type="submit">[ ENTER ] ADD</button>
       </div>
     </form>
 
-    <nav class="tabs" aria-label="Views">
-      <button class="tab" type="button" data-view="upcoming" aria-pressed="true">Upcoming <span class="count" data-count="upcoming"></span></button>
-      <button class="tab" type="button" data-view="queue" aria-pressed="false">Queue <span class="count" data-count="queue"></span></button>
-      <button class="tab" type="button" data-view="read" aria-pressed="false">Read <span class="count" data-count="read"></span></button>
-      <span class="tabs-spacer"></span>
-      <label class="visually-hidden" for="search">Search papers</label>
-      <input class="search" id="search" type="search" placeholder="Search" spellcheck="false">
-    </nav>
+    <div class="viewbar" id="viewbar" hidden></div>
 
-    <div class="filterbar" id="filterbar" hidden>
-      <span class="filter-label">Tag</span>
-      <button class="chip chip-active" id="tag-clear" type="button" aria-label="Clear tag filter"></button>
+    <div class="body">
+      <main class="list" id="list" tabindex="-1" aria-busy="true" aria-label="Items"></main>
+
+      <aside class="side" aria-label="Selected item and status">
+        <section class="panel" id="detail-panel" aria-labelledby="detail-head">
+          <div class="panel-bar"><span id="detail-head">SELECTED</span><span id="detail-pos"></span></div>
+          <div class="panel-body" id="detail"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="status-head">
+          <div class="panel-bar"><span id="status-head">STATUS</span></div>
+          <div class="panel-body">
+            <div class="meters" id="meters"></div>
+            <dl class="lines">
+              <div class="line"><dt>LIBRARY</dt><dd><span id="library-status">…</span> <button class="mini" id="library-sync" type="button" hidden>[SYNC]</button></dd></div>
+              <div class="line"><dt>CALENDAR</dt><dd><span id="calendar-status">…</span> <button class="mini" id="calendar-sync" type="button" hidden>[RESYNC]</button></dd></div>
+              <div class="line"><dt>NEXT FREE SLOT</dt><dd id="next-slot">…</dd></div>
+              <div class="line" id="media-line" hidden><dt>DOWNLOADS</dt><dd id="media-status"></dd></div>
+            </dl>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="tools-head">
+          <div class="panel-bar"><span id="tools-head">TOOLS</span></div>
+          <div class="panel-body tools">
+            <div class="tool">
+              <a class="key" id="bookmarklet" href="#" draggable="true">SAVE TO PAPERQUEUE</a>
+              <span class="hint">Drag to the bookmarks bar, then click it on any paper page.</span>
+            </div>
+            <div class="tool">
+              <button class="key" id="iphone-open" type="button">OPEN ON IPHONE</button>
+            </div>
+            <div class="tool tool-row">
+              <span class="tool-label" id="theme-label">THEME</span>
+              <span class="seg" role="group" aria-labelledby="theme-label" id="theme-seg">
+                <button type="button" data-theme-choice="system" aria-pressed="true">SYSTEM</button>
+                <button type="button" data-theme-choice="light" aria-pressed="false">LIGHT</button>
+                <button type="button" data-theme-choice="dark" aria-pressed="false">DARK</button>
+              </span>
+            </div>
+            <div class="tool tool-row">
+              <span class="tool-label" id="scan-label">SCANLINES</span>
+              <button class="mini" id="scan-toggle" type="button" aria-pressed="false" aria-labelledby="scan-label scan-toggle">[ OFF ]</button>
+            </div>
+          </div>
+        </section>
+      </aside>
     </div>
 
-    <div class="viewbar" id="viewbar"></div>
-
-    <main id="list" class="list" tabindex="-1" aria-live="polite" aria-busy="true"></main>
-
-    <footer class="footer">
-      <dl class="status-list">
-        <div class="status-row">
-          <dt>Library</dt>
-          <dd><span id="library-status">…</span>
-            <button class="link-button" id="library-sync" type="button">Sync</button></dd>
-        </div>
-        <div class="status-row">
-          <dt>Calendar</dt>
-          <dd><span id="calendar-status">…</span>
-            <button class="link-button" id="calendar-sync" type="button">Re-sync</button></dd>
-        </div>
-        <div class="status-row">
-          <dt>PDFs</dt>
-          <dd><span id="pdf-status">…</span></dd>
-        </div>
-        <div class="status-row">
-          <dt>YouTube</dt>
-          <dd><span id="media-status">…</span></dd>
-        </div>
-        <div class="status-row">
-          <dt>Bookmarklet</dt>
-          <dd><a class="bookmarklet" id="bookmarklet" href="#" draggable="true">Save to paperqueue</a>
-            <span class="hint">Drag to your bookmarks bar, then click it on any paper page.</span></dd>
-        </div>
-        <div class="status-row">
-          <dt>iPhone</dt>
-          <dd><button class="link-button" id="iphone-open" type="button">Open on iPhone</button></dd>
-        </div>
-      </dl>
-      <p class="colophon">Keys: <kbd>/</kbd> search · <kbd>n</kbd> add a paper · <kbd>1</kbd>–<kbd>3</kbd> switch views</p>
+    <footer class="foot">
+      <span id="foot-status"></span>
+      <span class="foot-keys"><kbd>/</kbd> SEARCH · <kbd>N</kbd> ADD · <kbd>J/K</kbd> MOVE · <kbd>1–4</kbd> VIEWS</span>
     </footer>
   </div>
 
+  <div class="phone-foot" id="phone-foot"><span id="phone-foot-left"></span><span id="phone-foot-right"></span></div>
+
   <dialog class="dialog" id="schedule-dialog" aria-labelledby="schedule-title">
-    <form method="dialog" class="dialog-body" id="schedule-form">
-      <p class="dialog-kicker" id="schedule-kicker">Schedule reading</p>
-      <h2 class="dialog-title" id="schedule-title"></h2>
-      <p class="dialog-current" id="schedule-current"></p>
-      <div class="field-row">
-        <label class="field">
-          <span class="field-label">Date and time</span>
-          <input type="datetime-local" id="schedule-at" step="300">
-        </label>
-        <label class="field field-narrow">
-          <span class="field-label">Minutes</span>
-          <input type="number" id="schedule-duration" min="5" max="480" step="5" inputmode="numeric">
-        </label>
+    <form method="dialog" class="dialog-form" id="schedule-form">
+      <div class="panel-bar"><span id="schedule-kicker">RESCHEDULE</span><button class="mini" value="cancel" type="submit" formnovalidate aria-label="Close">ESC CLOSE</button></div>
+      <div class="dialog-body">
+        <h2 class="dialog-title"><span class="ink" aria-hidden="true">&gt;</span> <span id="schedule-title"></span></h2>
+        <p class="dialog-note" id="schedule-current"></p>
+        <div class="field-row">
+          <label class="field">DATE &amp; TIME
+            <input class="input" type="datetime-local" id="schedule-at" step="300">
+          </label>
+          <label class="field field-narrow">MINUTES
+            <input class="input" type="number" id="schedule-duration" min="5" max="480" step="5" inputmode="numeric">
+          </label>
+        </div>
+        <div class="field">
+          <span>FREE SLOTS</span>
+          <div class="slots" id="schedule-slots"><span class="hint">LOADING…</span></div>
+        </div>
+        <div class="dialog-actions">
+          <button class="cta" type="button" id="schedule-save">[ENTER] SAVE</button>
+          <button class="key" type="button" id="schedule-next"><b>[N]</b> NEXT FREE</button>
+          <button class="key" type="button" id="schedule-clear"><b>[U]</b> UNSCHEDULE</button>
+        </div>
       </div>
-      <div class="slot-block">
-        <span class="field-label">Free slots</span>
-        <div class="chips" id="schedule-slots"><span class="hint">Loading…</span></div>
-      </div>
-      <div class="dialog-actions">
-        <button class="button" type="button" id="schedule-next">Next free slot</button>
-        <button class="button button-quiet" type="button" id="schedule-clear">Unschedule</button>
-        <span class="dialog-spacer"></span>
-        <button class="button button-quiet" value="cancel" type="submit" formnovalidate>Cancel</button>
-        <button class="button button-primary" type="button" id="schedule-save">Save</button>
+    </form>
+  </dialog>
+
+  <dialog class="dialog" id="qr-dialog" aria-labelledby="qr-title">
+    <form method="dialog" class="dialog-form">
+      <div class="panel-bar noprint"><span>SEND TO PHONE</span><button class="mini" value="close" type="submit" aria-label="Close">ESC CLOSE</button></div>
+      <div class="dialog-body qr-body">
+        <h2 class="dialog-title" id="qr-title"></h2>
+        <span class="seg noprint" role="group" aria-label="Link to encode" id="qr-target">
+          <button type="button" data-target="url" aria-pressed="true">PAGE</button>
+          <button type="button" data-target="pdf" aria-pressed="false">PDF</button>
+        </span>
+        <img class="qr" id="qr-img" alt="" width="232" height="232">
+        <p class="qr-link" id="qr-link"></p>
+        <p class="dialog-note noprint">Scan with the iPhone camera. The code holds the item’s public link, not this Mac’s address, so it works on any network.</p>
+        <div class="dialog-actions noprint">
+          <button class="key" type="button" id="qr-print"><b>[P]</b> PRINT</button>
+        </div>
       </div>
     </form>
   </dialog>
 
   <dialog class="dialog" id="iphone-dialog" aria-labelledby="iphone-title">
-    <form method="dialog" class="dialog-body">
-      <p class="dialog-kicker">Read on the go</p>
-      <h2 class="dialog-title" id="iphone-title">Open on iPhone</h2>
-      <div id="iphone-lan" hidden>
-        <img class="qr" id="iphone-qr" alt="QR code linking to paperqueue on this Mac" width="216" height="216">
+    <form method="dialog" class="dialog-form">
+      <div class="panel-bar"><span id="iphone-title">OPEN ON IPHONE</span><button class="mini" value="close" type="submit" aria-label="Close">ESC CLOSE</button></div>
+      <div class="dialog-body">
         <ol class="steps">
-          <li>Scan with the iPhone camera while on the same Wi-Fi.</li>
-          <li>In Safari, tap Share, then Add to Home Screen.</li>
-          <li>The link carries your access token, so keep it to yourself.</li>
+          <li><span class="ink">[1]</span> <span><b>Already on your phone, no setup.</b> Reading sessions are in the <span id="iphone-cal">iCloud</span> calendar, with an alert before each one. Cached PDFs and downloaded media are in iCloud Drive (Files app, <span class="nowrap">PaperQueue</span> folder).</span></li>
+          <li><span class="ink">[2]</span> <span><b>Send one item.</b> Select it and press <kbd>Q</kbd> (or [Q] PHONE) for a QR code of its public link. It works on any network and can be printed.</span></li>
+          <li><span class="ink">[3]</span> <span><b>The whole app on the phone.</b> Run <code>paperqueue serve --lan</code> (home Wi-Fi only; the link carries an access token, so keep it to yourself), or use a private network such as Tailscale and add its name to <code>server.extra_hosts</code>.</span></li>
         </ol>
-        <p class="hint" id="iphone-urls"></p>
-      </div>
-      <div id="iphone-off" hidden>
-        <ol class="steps">
-          <li>On this Mac, run <code>paperqueue serve --lan</code> and scan the QR code it prints (it also appears here).</li>
-          <li>In Safari on the iPhone, tap Share, then Add to Home Screen for an app-like queue.</li>
-          <li>Reading sessions are already on your iPhone through the iCloud calendar, with a reminder before each one.</li>
-          <li>Cached PDFs are in iCloud Drive, in the <span class="nowrap">PaperQueue</span> folder of the Files app, for offline reading; downloaded videos are in <span class="nowrap">PaperQueue/Media</span>.</li>
-        </ol>
-      </div>
-      <div class="dialog-actions">
-        <span class="dialog-spacer"></span>
-        <button class="button" value="close" type="submit">Done</button>
+        <div class="lan" id="iphone-lan" hidden>
+          <p class="dialog-note"><span class="ink">[OK]</span> LAN IS ON. Scan on the same Wi-Fi, then in Safari tap Share, Add to Home Screen.</p>
+          <img class="qr" id="iphone-qr" alt="QR code with the token link to paperqueue on this Mac" width="216" height="216">
+          <p class="hint" id="iphone-urls"></p>
+        </div>
+        <p class="dialog-note" id="iphone-off"><span class="dim">[ - ]</span> LAN IS OFF, so there is no app QR code here.</p>
       </div>
     </form>
   </dialog>

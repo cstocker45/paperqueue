@@ -17,7 +17,7 @@ from paperqueue import mediacache, metadata
 from paperqueue.config import Config, load_config
 from paperqueue.metadata import PaperMeta, Resolver
 from paperqueue.service import PaperQueue
-from paperqueue.types import CalendarError, EventSpec, LibraryItem, event_marker
+from paperqueue.types import CalendarError, EventSpec, LibraryError, LibraryItem, LibraryUnavailable, event_marker
 
 # Monday 16 Nov 2026, 07:00 in Berlin.
 NOW = datetime(2026, 11, 16, 6, 0, tzinfo=UTC)
@@ -260,6 +260,7 @@ class FakeLibrary:
     pushed: list[tuple[PaperMeta, list[str]]] = field(default_factory=list)
     pdfs: dict[str, Path] = field(default_factory=dict)
     fail_push: bool = False
+    closed: bool = False  # like Zotero desktop not running
 
     @property
     def can_write(self) -> bool:
@@ -269,9 +270,13 @@ class FakeLibrary:
         return True, "fake library"
 
     def pull(self) -> list[LibraryItem]:
+        if self.closed:
+            raise LibraryError("library is not running")
         return list(self.items)
 
     def push(self, meta: PaperMeta, tags: list[str]) -> str | None:
+        if self.closed:
+            raise LibraryUnavailable("library is not running")
         if self.fail_push:
             raise RuntimeError("HTTP 403 from library")
         self.pushed.append((meta, tags))

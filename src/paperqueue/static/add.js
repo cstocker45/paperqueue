@@ -35,6 +35,11 @@
   function toast(message, kind) {
     const node = document.createElement("div");
     node.className = `toast toast-${kind || "info"}`;
+    const tick = document.createElement("span");
+    tick.className = "toast-tick";
+    tick.setAttribute("aria-hidden", "true");
+    tick.textContent = { warn: "[ ! ]", error: "[ERR]" }[kind] || "[OK]";
+    node.append(tick);
     const text = document.createElement("span");
     text.className = "toast-text";
     text.textContent = message;
@@ -62,7 +67,7 @@
   // ---- render the hints
 
   $("#hint-title").textContent = hints.title || ref || "Nothing to save";
-  if (!hints.title && ref) $("#hint-kicker").textContent = "Reference";
+  if (!hints.title && ref) $("#hint-kicker").textContent = "REFERENCE";
   document.title = hints.title ? `Save: ${hints.title}` : "Save to paperqueue";
 
   const meta = $("#hint-meta");
@@ -85,18 +90,18 @@
   }
   if (hints.authors) {
     const a = hints.authors;
-    row("Authors", a.length > 6 ? `${a.slice(0, 5).join(", ")} and ${a.length - 5} more` : a.join(", "));
+    row("AUTHORS", a.length > 6 ? `${a.slice(0, 5).join(", ")} and ${a.length - 5} more` : a.join(", "));
   }
-  row("Journal", [hints.journal, hints.date].filter(Boolean).join(" · "));
+  row("JOURNAL", [hints.journal, hints.date].filter(Boolean).join(" · "));
   if (hints.doi) row("DOI", hints.doi, `https://doi.org/${encodeURI(hints.doi)}`);
   if (hints.url) {
     let host = hints.url;
     try {
       host = new URL(hints.url).host + new URL(hints.url).pathname.replace(/\/$/, "");
     } catch (_) {}
-    row("Page", host, safeUrl(hints.url));
+    row("PAGE", host, safeUrl(hints.url));
   }
-  row("PDF", hints.pdf_url ? "Available" : "", safeUrl(hints.pdf_url));
+  row("PDF", hints.pdf_url ? "AVAILABLE" : "", safeUrl(hints.pdf_url));
   if (hints.abstract) {
     const p = $("#hint-abstract");
     p.textContent = hints.abstract.length > 600 ? hints.abstract.slice(0, 600).trimEnd() + " …" : hints.abstract;
@@ -156,7 +161,7 @@
       .map((t) => t.trim())
       .filter(Boolean);
     saveButton.disabled = true;
-    saveButton.textContent = "Saving…";
+    saveButton.textContent = "SAVING…";
     try {
       const res = await fetch("/api/papers", {
         method: "POST",
@@ -178,7 +183,7 @@
     } catch (err) {
       toast(err.message || String(err), "error");
       saveButton.disabled = false;
-      saveButton.textContent = "Save";
+      saveButton.textContent = "[ENTER] SAVE";
     }
   }
 
@@ -187,7 +192,7 @@
     const start = p.scheduled_start_local || p.scheduled_local || p.scheduled_start;
     form.hidden = true;
     $("#result").hidden = false;
-    $("#result-title").textContent = data.created === false ? "Already in your queue" : "Saved";
+    $("#result-title").textContent = data.created === false ? "[OK] ALREADY IN YOUR QUEUE" : "[OK] SAVED";
     $("#result-when").textContent = start
       ? `Reading session: ${whenText(start)}${p.duration_minutes ? `, ${p.duration_minutes} min` : ""}.`
       : "In your queue, not scheduled yet.";
@@ -198,6 +203,7 @@
   form.addEventListener("submit", save);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !form.hidden) save(e);
+    else if (e.key === "Escape" && !form.hidden) closeTab();
   });
 
   function closeTab() {

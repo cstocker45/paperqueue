@@ -35,9 +35,11 @@ provider = "off"
 # "web" reads the Zotero web API (needs user_id + api_key).
 source = "local"
 collection = "To read"
-# Optional, for writing papers you add here (or via an agent) back into Zotero,
-# so they sync to Zotero on your iPhone. Create a key at https://www.zotero.org/settings/keys
-# You can also set ZOTERO_USER_ID / ZOTERO_API_KEY in the environment instead.
+# With source = "local", papers you add here (or via an agent) are written into this collection
+# through Zotero desktop's local connector: no account or key, but Zotero must be open (papers
+# added while it is closed are added when it is next open). Zotero attaches the PDF.
+# Optional: a web API key writes through api.zotero.org instead (it takes precedence when set).
+# Create one at https://www.zotero.org/settings/keys, or set ZOTERO_USER_ID / ZOTERO_API_KEY.
 user_id = ""
 api_key = ""
 push_new_papers = true

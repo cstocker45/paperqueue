@@ -36,7 +36,8 @@ ARXIV_OLD = r"[a-z][a-z\-]+(?:\.[A-Z]{2})?/\d{7}"
 ARXIV_ID_RE = re.compile(rf"^(?:arxiv:)?\s*({ARXIV_NEW}|{ARXIV_OLD})(v\d+)?$", re.I)
 ARXIV_URL_RE = re.compile(rf"arxiv\.org/(?:abs|pdf|html)/({ARXIV_NEW}|{ARXIV_OLD})(v\d+)?", re.I)
 ARXIV_DOI_RE = re.compile(rf"10\.48550/arxiv\.({ARXIV_NEW}|{ARXIV_OLD})(v\d+)?", re.I)
-RXIV_DOI_RE = re.compile(r"(10\.1101/(?:\d{4}\.\d{2}\.\d{2}\.\d+|\d{6}))(?:v(\d+))?", re.I)
+# bioRxiv/medRxiv DOIs: the original 10.1101 prefix and the newer 10.64898 one.
+RXIV_DOI_RE = re.compile(r"(10\.(?:1101|64898)/(?:\d{4}\.\d{2}\.\d{2}\.\d+|\d{6}))(?:v(\d+))?", re.I)
 DOI_RE = re.compile(r"\b(10\.\d{4,9}/[^\s\"<>&?#]+)", re.I)
 NATURE_URL_RE = re.compile(r"nature\.com/articles/([a-z0-9\-]+)", re.I)
 PMC_RE = re.compile(r"(?:^|/|pmcid:?\s*)(PMC\d{4,9})\b", re.I)

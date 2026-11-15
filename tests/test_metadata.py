@@ -349,3 +349,12 @@ def test_youtube_unavailable(router: Router, resolver: Resolver, ytdlp) -> None:
         resolver.resolve(f"https://youtu.be/{VID}")
     meta = resolver.resolve(f"https://youtu.be/{VID}", {"title": "From the page"})
     assert (meta.title, meta.video_id, meta.venue, meta.matched_by) == ("From the page", VID, "YouTube", "hints")
+
+
+def test_new_biorxiv_doi_prefix_strips_version() -> None:
+    from paperqueue.metadata import parse_ref
+
+    for ref in ("https://doi.org/10.64898/2026.10.07.756550v1",
+                "https://www.biorxiv.org/content/10.64898/2026.10.07.756550v1.full"):
+        r = parse_ref(ref)
+        assert (r.kind, r.value) == ("doi", "10.64898/2026.10.07.756550")

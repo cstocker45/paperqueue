@@ -203,7 +203,7 @@ def step_local_api(s: Setup) -> None:
     if not s.apply:
         s.report(name, PENDING, f"would add the local API setting to {profile / 'user.js'}")
         return
-    merge_user_js(profile)
+    wrote = merge_user_js(profile)
     _start_zotero()
     waited = 0.0
     while waited < API_WAIT_SECONDS:
@@ -212,7 +212,10 @@ def step_local_api(s: Setup) -> None:
         state = probe_local_api(s.cfg)
         if state == "enabled":
             s.api_enabled = True
-            s.report(name, DONE, f"turned on in {profile / 'user.js'} and started Zotero")
+            if wrote:
+                s.report(name, DONE, f"turned on in {profile / 'user.js'} and started Zotero")
+            else:
+                s.report(name, OK, "enabled (Zotero was closed, so setup started it)")
             return
         if state != "down":  # Zotero is up but did not take the setting
             s.report(name, NEEDS_YOU, f"{LOCAL_API_SETTING}, then re-run `paperqueue setup`")
@@ -262,7 +265,7 @@ def step_collection(s: Setup) -> None:
         s.report(name, OK, msg)
     elif "no collection named" in msg:
         s.report(name, NEEDS_YOU, f"in Zotero choose File > New Collection and name it '{zcfg.collection}' "
-                                  "(with a Zotero API key in the config, paperqueue creates it on the first push)")
+                                  "in My Library; paperqueue then reads and writes it via the local connector")
     else:
         s.report(name, NEEDS_YOU, msg)
 

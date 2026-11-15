@@ -21,7 +21,7 @@ import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import Body, FastAPI, Query, Request
@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import __version__
 from .mediacache import SUFFIXES as MEDIA_TYPES
 from .mediacache import fix_for
 
@@ -175,6 +176,46 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+# Manifest colours per theme; the page swaps the manifest link when the user picks a theme.
+THEME_COLORS = {"light": "#f4f7f5", "dark": "#0b0d0c"}
+
+
+def _public_link(raw: Any, token: str = "") -> str | None:
+    """`raw` if it is a public http(s) link that is safe to put in a QR code, else None.
+
+    Only links stored on the item qualify: no other scheme, no credentials, no loopback or
+    ``localhost`` host, and never anything that carries the server token.
+    """
+    if not isinstance(raw, str):
+        return None
+    url = raw.strip()
+    if not url or any(c.isspace() for c in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").rstrip(".")
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not host or parts.username or parts.password:
+        return None
+    if host == "localhost" or host.endswith(".localhost") or _is_loopback(host):
+        return None
+    if token and token in url:
+        return None
+    return url
+
+
+def _media_bytes(paper: Any) -> int | None:
+    raw = getattr(paper, "media_path", None)
+    if not raw:
+        return None
+    try:
+        path = Path(raw)
+        return path.stat().st_size if path.is_file() else None
+    except OSError:
+        return None
+
+
 def _default_queue():
     from .config import load_config
     from .service import PaperQueue
@@ -246,6 +287,8 @@ def create_app(
             d["library_link"] = library_link(paper)
         if d.get("media_error"):
             d["media_fix"] = fix_for(d["media_error"])
+        if d.get("has_media"):
+            d["media_bytes"] = _media_bytes(paper)
         return d
 
     def lan_urls() -> list[str]:
@@ -348,7 +391,7 @@ def create_app(
     def status() -> dict[str, Any]:
         st = _jsonable(q.status())
         st["lan"] = {"enabled": lan, "urls": lan_urls()}
-        st["server"] = {"port": port}
+        st["server"] = {"port": port, "version": __version__}
         return st
 
     @app.get("/api/papers")
@@ -498,6 +541,30 @@ def create_app(
         )
         return Response(buf.getvalue(), media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/papers/{paper_id}/qr.svg")
+    def paper_qr_svg(paper_id: int, target: str = "url") -> Response:
+        """A QR code of the item's own public link (its page, or its PDF), for opening it on a phone.
+
+        It encodes only an http(s) URL stored on the item, never this server's address or token,
+        so it works on any network and is safe to print.
+        """
+        if target not in ("url", "pdf"):
+            raise ValueError("target must be url or pdf")
+        paper = q.get(paper_id)
+        link = _public_link(getattr(paper, "url" if target == "url" else "pdf_url", None), token)
+        if link is None:
+            what = "web link" if target == "url" else "PDF link"
+            raise ValueError(f"item {paper_id} has no public {what}")
+        import io
+
+        import segno
+
+        buf = io.BytesIO()
+        segno.make(link, error="m").save(
+            buf, kind="svg", scale=8, border=4, dark="#000000", light="#ffffff", xmldecl=False
+        )
+        return Response(buf.getvalue(), media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+
     # pages -----------------------------------------------------------------------
 
     def _page(name: str) -> FileResponse:
@@ -513,8 +580,9 @@ def create_app(
         return _page("add.html")
 
     @app.get("/manifest.webmanifest", include_in_schema=False)
-    def manifest() -> Response:
+    def manifest(theme: str = "light") -> Response:
         start_url = with_token("/") if lan else "/"
+        color = THEME_COLORS.get(theme, THEME_COLORS["light"])
         data = {
             "name": "paperqueue",
             "short_name": "Papers",
@@ -522,8 +590,8 @@ def create_app(
             "start_url": start_url,
             "scope": "/",
             "display": "standalone",
-            "background_color": "#f7f6f3",
-            "theme_color": "#f7f6f3",
+            "background_color": color,
+            "theme_color": color,
             "icons": [
                 {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
                 {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
