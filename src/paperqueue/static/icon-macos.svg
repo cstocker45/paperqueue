@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- paperqueue app icon: a bookmarked sheet with terminal entries between brackets, on a dark tile. macOS grid: an 824 px tile
+       (radius 185) centred on a 1024 px canvas with a transparent margin. Rebuild with scripts/build_icons.sh. -->
+  <defs>
+    <pattern id="scan" width="8" height="8" patternUnits="userSpaceOnUse">
+      <rect width="8" height="3" fill="#fff" opacity="0.045"/>
+    </pattern>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="7" result="blur"/>
+      <feComponentTransfer in="blur" result="soft">
+        <feFuncA type="linear" slope="0.75"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode in="soft"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#0b0d0c"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#scan)"/>
+  <rect x="102" y="102" width="820" height="820" rx="183" fill="none" stroke="#24302c" stroke-width="4"/>
+  <g filter="url(#glow)">
+    <path d="M396 270 H306 V754 H396" fill="none" stroke="#2dd4b2" stroke-width="44" stroke-linejoin="miter"/>
+    <path d="M628 270 H718 V754 H628" fill="none" stroke="#2dd4b2" stroke-width="44" stroke-linejoin="miter"/>
+    <rect x="376" y="300" width="272" height="424" rx="22" fill="#0d1211" stroke="#2dd4b2" stroke-width="12"/>
+    <path d="M582 300 V378 L604 362 L626 378 V300 Z" fill="#2dd4b2"/>
+    <path d="M410 392 L440 414 L410 436" fill="none" stroke="#2dd4b2" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="454" y="424" width="40" height="12" rx="2" fill="#2dd4b2"/>
+    <rect x="410" y="486" width="26" height="26" rx="4" fill="#2dd4b2" fill-opacity="0.35"/>
+    <rect x="452" y="489" width="160" height="20" rx="4" fill="#2dd4b2" fill-opacity="0.3"/>
+    <rect x="413" y="557" width="20" height="20" rx="3" fill="none" stroke="#2dd4b2" stroke-width="6"/>
+    <rect x="452" y="557" width="160" height="20" rx="4" fill="#2dd4b2"/>
+    <rect x="413" y="625" width="20" height="20" rx="3" fill="none" stroke="#2dd4b2" stroke-opacity="0.45" stroke-width="6"/>
+    <rect x="452" y="625" width="112" height="20" rx="4" fill="#2dd4b2" fill-opacity="0.45"/>
+  </g>
+</svg>

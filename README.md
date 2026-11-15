@@ -46,16 +46,50 @@ cd paperqueue
 uv tool install -e .
 ```
 
+Then let paperqueue set up the rest:
+
+```sh
+paperqueue setup
+```
+
+`setup` works through each step and reports it as **ok**, **done**, **skipped** or **needs you**:
+
+1. Installs Zotero with Homebrew (`brew install --cask zotero`), after asking. Without Homebrew it
+   points you to the [Zotero download page](https://www.zotero.org/download/).
+2. Turns on Zotero's local API and sets `provider = "zotero"` if the provider is still `"off"`.
+3. Checks for the **To read** collection and the **Reading List** calendar.
+4. Installs the background service, the Claude Code MCP server and skill, and the paperqueue app
+   with a shortcut on your Desktop.
+
+It ends with a short list of anything left for you to do, such as clicking a setting in Zotero.
+Do those, then run `paperqueue setup` again; finished steps are skipped. Pass `--yes` to accept
+the defaults without questions, and `--no-zotero` or `--no-shortcut` to leave those steps out.
+Setup never uses `sudo`, never installs Homebrew, never quits an app that is running, and never
+replaces a library provider you already chose.
+
 ## Quick start
 
 ```sh
-paperqueue serve            # then open http://localhost:8765
+paperqueue open             # or double-click paperqueue on your Desktop
 paperqueue add 1706.03762   # or a DOI, a URL, or a title
 paperqueue upcoming
 ```
 
 Settings live in `~/.paperqueue/config.toml`, which is created on first run. Run
 `paperqueue doctor` at any point to check the setup; it prints a fix for each failed check.
+
+## The app and its Desktop shortcut
+
+`paperqueue setup` (or `paperqueue install-shortcut`) creates `~/Applications/paperqueue.app`
+and a shortcut to it on your Desktop, both with the paperqueue icon. Opening it starts the
+background service if it is not running and opens the web app in its own Chrome window, using
+your normal Chrome profile; without Chrome it opens in your default browser. While the window is
+open, the Dock shows Chrome's icon. `paperqueue open` does the same from the terminal.
+
+Use `install-shortcut --no-desktop` for the app alone. If macOS asks whether your terminal may
+access the Desktop folder, allow it, or drag the app from `~/Applications` to the Desktop with
+Cmd-Option held. If you reinstall paperqueue somewhere else, `paperqueue doctor` reports the
+launcher as out of date and `paperqueue setup` refreshes it.
 
 ## Apple Calendar
 
@@ -139,6 +173,8 @@ yt-dlp uses your signed-in browser session, then choose the mode again.
 
 ## Zotero (optional)
 
+`paperqueue setup` does steps 1 and 3 for you and checks step 2. To do it by hand:
+
 1. Install Zotero 7 and enable **Settings > Advanced > Allow other applications on this computer
    to communicate with Zotero** (the local API). Zotero must be running when paperqueue syncs.
 2. Create a collection named **To read**, or set `collection` under `[zotero]`.
@@ -178,7 +214,8 @@ The folder used is **To read**; set `folder` under `[mendeley]` to change it.
 
 ## Agents (Claude Code, Claude Desktop, Cursor)
 
-Register the MCP server with Claude Code for all your projects, and install the skill:
+`paperqueue setup` does this for Claude Code when it finds the `claude` command. By hand,
+register the MCP server with Claude Code for all your projects, and install the skill:
 
 ```sh
 claude mcp add -s user paperqueue -- paperqueue mcp
@@ -213,6 +250,8 @@ The MCP server works directly on the local database, so `serve` does not need to
 
 ## Run at login
 
+`paperqueue setup` installs the service. To manage it yourself:
+
 ```sh
 paperqueue install-service             # LaunchAgent: starts `serve` at login, restarts on failure
 paperqueue install-service --dry-run   # show the plist without installing it
@@ -222,10 +261,24 @@ paperqueue install-service --uninstall
 Logs go to `~/.paperqueue/logs/`. The first calendar sync from the service may trigger the
 Automation prompt again, this time for Python.
 
+## Uninstall
+
+```sh
+paperqueue uninstall --dry-run   # show what would be removed
+paperqueue uninstall             # remove the service, the app and Desktop shortcut, and the skill
+uv tool uninstall paperqueue
+```
+
+`uninstall` removes only what paperqueue created. It keeps your queue and settings in
+`~/.paperqueue`, and it leaves Zotero and its settings alone. Remove the MCP server with
+`claude mcp remove -s user paperqueue`.
+
 ## Commands
 
 | Command | |
 |---|---|
+| `setup [--yes] [--no-zotero] [--no-shortcut]` | Install and connect everything; safe to re-run |
+| `open` | Open the web app in its own window, starting the service if needed |
 | `serve [--lan] [--port N] [--no-maintenance]` | Web app plus background sync |
 | `add REF [--when W] [--priority P] [--tag T] [--title T] [--notes N] [--media M]` | Add a paper or video |
 | `media ID link\|audio\|video` | Keep a video as a link, or download it |
@@ -238,6 +291,8 @@ Automation prompt again, this time for Python.
 | `doctor` | Check the setup |
 | `config` | Show the config path and contents, with secrets masked |
 | `mcp`, `install-skill`, `install-service` | Agents and background service |
+| `install-shortcut [--no-desktop]` | The paperqueue app and its Desktop shortcut |
+| `uninstall [--dry-run]` | Remove the service, the app and the skill; keeps your data |
 | `mendeley login` | Authorise Mendeley |
 
 `WHEN` can be `next` (the default), `today`, `tomorrow`, a weekday, `YYYY-MM-DD`, an ISO datetime
@@ -294,7 +349,9 @@ uv run pytest
 uv run paperqueue serve
 ```
 
-The code lives in `src/paperqueue/`. `service.py` holds the business logic, which the web API
+The code lives in `src/paperqueue/`. The icon masters are `static/icon-macos.svg` (the macOS app
+icon) and `static/icon.svg` (the web app); `scripts/build_icons.sh` renders them into
+`assets/paperqueue.icns` and the PNGs, using Chrome, `sips` and `iconutil`. `service.py` holds the business logic, which the web API
 (`server.py`), the CLI (`cli.py`) and the MCP server (`mcp_server.py`) all share. The tests mock
 all HTTP and never touch your real calendar or library.
 

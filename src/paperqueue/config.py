@@ -304,21 +304,41 @@ def _write_private(path: Path, text: str) -> None:
         f.write(text)
 
 
+def _set_in_section(text: str, section: str, key: str, value: str) -> str:
+    """Return `text` with `key = value` (value already TOML-encoded) set inside `[section]`, keeping
+    everything else, comments included, as it was."""
+    line = f"{key} = {value}"
+    header = re.search(rf"(?m)^\[{re.escape(section)}\][ \t]*$", text)
+    if header is None:
+        return text.rstrip("\n") + f"\n\n[{section}]\n{line}\n"
+    end = re.search(r"(?m)^\[", text[header.end() :])
+    body_end = header.end() + end.start() if end else len(text)
+    body = text[header.end() : body_end]
+    body, n = re.subn(rf"(?m)^{re.escape(key)}[ \t]*=.*$", line, body, count=1)
+    if not n:
+        body = f"\n{line}" + body
+    return text[: header.end()] + body + text[body_end:]
+
+
 def _persist_token(path: Path, text: str, token: str) -> None:
     """Write a generated token into the [server] section of an existing config file."""
-    line = f'token = "{token}"'
-    section = re.search(r"(?m)^\[server\][ \t]*$", text)
-    if section is None:
-        text = text.rstrip("\n") + f"\n\n[server]\n{line}\n"
-    else:
-        end = re.search(r"(?m)^\[", text[section.end() :])
-        body_end = section.end() + end.start() if end else len(text)
-        body = text[section.end() : body_end]
-        body, n = re.subn(r"(?m)^token[ \t]*=.*$", line, body, count=1)
-        if not n:
-            body = f"\n{line}" + body
-        text = text[: section.end()] + body + text[body_end:]
-    _write_private(path, text)
+    _write_private(path, _set_in_section(text, "server", "token", f'"{token}"'))
+
+
+def file_library_provider(path: Path) -> str:
+    """`[library] provider` as written in the config file, ignoring PAPERQUEUE_LIBRARY."""
+    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    library = raw.get("library")
+    value = library.get("provider", "off") if isinstance(library, dict) else "off"
+    return str(value).strip().lower()
+
+
+def set_library_provider(path: Path, provider: str) -> None:
+    """Set `[library] provider` in the config file in place."""
+    if provider not in PROVIDERS:
+        raise ConfigError(f"[library] provider must be one of {', '.join(PROVIDERS)}")
+    text = path.read_text(encoding="utf-8")
+    _write_private(path, _set_in_section(text, "library", "provider", f'"{provider}"'))
 
 
 def load_config(home: Path | None = None) -> Config:

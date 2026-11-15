@@ -1,6 +1,6 @@
 [project]
 name = "paperqueue"
-version = "0.2.0"
+version = "0.3.0"
 description = "A local reading queue for research papers and YouTube talks: Zotero/Mendeley sync, Apple Calendar scheduling (synced to iPhone), a localhost web app, and an MCP server so agents can add and schedule papers."
 readme = "README.md"
 requires-python = ">=3.11"

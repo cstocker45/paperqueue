@@ -448,6 +448,8 @@ def cmd_doctor(args) -> int:
 
     results += _youtube_checks(cfg)
 
+    _app_checks(cfg)
+
     registered = _mcp_registered()
     if registered:
         _check(True, "MCP", "registered with Claude Code")
@@ -458,6 +460,36 @@ def cmd_doctor(args) -> int:
     failed = results.count(False)
     print("\nAll checks passed." if not failed else f"\n{failed} check(s) failed.")
     return 1 if failed else 0
+
+
+def _app_checks(cfg) -> None:
+    """Launcher and Zotero.app lines. Informational only: they never fail the run."""
+    from .onboarding import find_zotero_app
+    from .shortcut import app_path, app_state, desktop_link, link_state
+
+    state = app_state()
+    if state == "ok":
+        where = f"{app_path()}" + (" and the Desktop" if link_state() == "ok" else "")
+        _check(True, "Shortcut", where)
+    elif state == "missing":
+        print("[info] Shortcut: no launcher app; run `paperqueue install-shortcut` (or `paperqueue setup`)")
+    elif state == "stale":
+        _check(False, "Shortcut", f"{app_path()} is out of date (paperqueue moved or was upgraded)",
+               "paperqueue install-shortcut", level="warn")
+    else:
+        _check(False, "Shortcut", f"{app_path()} is not paperqueue's launcher",
+               "move it elsewhere, then run: paperqueue install-shortcut", level="warn")
+    if state in ("ok", "stale") and link_state() == "foreign":
+        _check(False, "Desktop shortcut", f"{desktop_link()} is not a link to the launcher", level="warn")
+
+    app = find_zotero_app()
+    if app:
+        _check(True, "Zotero app", str(app))
+    elif getattr(cfg.library, "provider", "off") == "zotero":
+        _check(False, "Zotero app", "not installed", "paperqueue setup (or https://www.zotero.org/download/)",
+               level="warn")
+    else:
+        print("[info] Zotero app: not installed (optional; `paperqueue setup` installs it)")
 
 
 def _mcp_registered() -> bool:
@@ -520,6 +552,43 @@ def build_plist(home: Path) -> dict[str, Any]:
     }
 
 
+def _service_loaded(domain: str) -> bool:
+    proc = subprocess.run(["launchctl", "print", f"{domain}/{SERVICE_LABEL}"], check=False, capture_output=True)
+    return proc.returncode == 0
+
+
+def service_state(cfg) -> str:
+    """ok (plist up to date and loaded), stale or missing."""
+    path = plist_path()
+    if not path.exists():
+        return "missing"
+    current = path.read_text(encoding="utf-8") == plistlib.dumps(build_plist(cfg.home)).decode()
+    return "ok" if current and _service_loaded(f"gui/{os.getuid()}") else "stale"
+
+
+def ensure_service(cfg, *, restart: bool = False, force: bool = False) -> tuple[str, str]:
+    """Install (or refresh) the LaunchAgent unless it is already current and loaded (`force` always
+    reinstalls, which also restarts it). Returns a setup-style (status, detail)."""
+    path = plist_path()
+    domain = f"gui/{os.getuid()}"
+    url = f"http://localhost:{cfg.server.port}/"
+    if not force and service_state(cfg) == "ok":
+        if not restart:
+            return "ok", f"running at login, {url}"
+        subprocess.run(["launchctl", "kickstart", "-k", f"{domain}/{SERVICE_LABEL}"], check=False,
+                       capture_output=True)
+        return "done", f"restarted to pick up the new config, {url}"
+    (cfg.home / "logs").mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    path.write_text(plistlib.dumps(build_plist(cfg.home)).decode(), encoding="utf-8")
+    proc = subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=False)
+    if proc.returncode != 0:
+        return "needs you", f"launchctl bootstrap failed ({proc.returncode}); the plist is at {path}"
+    return "done", f"installed {path}; runs at login, {url}"
+
+
 def cmd_install_service(args) -> int:
     cfg = load_cfg()
     path = plist_path()
@@ -541,17 +610,76 @@ def cmd_install_service(args) -> int:
     if sys.platform != "darwin":
         print("install-service needs macOS (launchd).", file=sys.stderr)
         return 1
-    (cfg.home / "logs").mkdir(parents=True, exist_ok=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}"], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    path.write_text(data)
-    proc = subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=False)
-    if proc.returncode != 0:
-        print(f"launchctl bootstrap failed ({proc.returncode}); the plist is at {path}", file=sys.stderr)
+    status, detail = ensure_service(cfg, force=True)
+    if status == "needs you":
+        print(detail, file=sys.stderr)
         return 1
-    print(f"Installed {path}\npaperqueue now runs at login: http://localhost:{cfg.server.port}/")
+    print(f"Installed {path}")
+    print(f"paperqueue now runs at login: http://localhost:{cfg.server.port}/")
     print(f"Logs: {cfg.home / 'logs'}")
+    return 0
+
+
+def cmd_setup(args) -> int:
+    from .onboarding import run_setup
+
+    return run_setup(yes=args.yes, zotero=not args.no_zotero, shortcut=not args.no_shortcut)
+
+
+def cmd_open(args) -> int:
+    from .shortcut import open_app
+
+    cfg = load_cfg()
+    return open_app(cfg.server.port, plist_path(), SERVICE_LABEL)
+
+
+def cmd_install_shortcut(args) -> int:
+    from .shortcut import NEEDS_YOU, install_shortcut
+
+    if sys.platform != "darwin":
+        print("install-shortcut needs macOS.", file=sys.stderr)
+        return 1
+    rows = install_shortcut(desktop=not args.no_desktop)
+    for row in rows:
+        print(f"[{row.status}] {row.name}: {row.detail}")
+    return 1 if any(r.status == NEEDS_YOU for r in rows) else 0
+
+
+def cmd_uninstall(args) -> int:
+    """Remove what paperqueue installed outside ~/.paperqueue: the service, the launcher and the skill."""
+    from .config import default_home
+    from .shortcut import remove_shortcut
+    from .skill import default_skill_path
+
+    dry = args.dry_run
+    verb = "Would remove" if dry else "Removed"
+    path = plist_path()
+    if path.exists():
+        if dry:
+            print(f"Would run: launchctl bootout gui/{os.getuid()}/{SERVICE_LABEL}")
+        else:
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{SERVICE_LABEL}"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            path.unlink(missing_ok=True)
+        print(f"{verb} {path}")
+    for line in remove_shortcut(dry_run=dry):
+        print(line)
+    skill = default_skill_path()
+    if skill.is_file():
+        if skill.read_text(encoding="utf-8").startswith("---\nname: paper-queue\n"):
+            if not dry:
+                skill.unlink()
+                try:
+                    skill.parent.rmdir()
+                except OSError:
+                    pass
+            print(f"{verb} {skill}")
+        else:
+            print(f"Left {skill} alone: it is not paperqueue's skill")
+    print(f"Kept your data in {default_home()}, Zotero, and Zotero's user.js.")
+    if _mcp_registered():
+        print("To unregister the MCP server: claude mcp remove -s user paperqueue")
+    print("To remove the command itself: uv tool uninstall paperqueue")
     return 0
 
 
@@ -654,6 +782,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--uninstall", action="store_true")
     s.add_argument("--dry-run", action="store_true", help="print the plist; change nothing")
     s.set_defaults(func=cmd_install_service)
+
+    s = sub.add_parser("setup", help="install and connect everything (Zotero, service, agents, app shortcut)")
+    s.add_argument("-y", "--yes", action="store_true", help="accept the defaults without asking")
+    s.add_argument("--no-zotero", action="store_true", help="don't install or connect Zotero")
+    s.add_argument("--no-shortcut", action="store_true", help="don't create the app and Desktop shortcut")
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("open", help="open the web app in its own window, starting the service if needed")
+    s.set_defaults(func=cmd_open)
+
+    s = sub.add_parser("install-shortcut", help="create ~/Applications/paperqueue.app and a Desktop shortcut")
+    s.add_argument("--no-desktop", action="store_true", help="only the app, no Desktop shortcut")
+    s.set_defaults(func=cmd_install_shortcut)
+
+    s = sub.add_parser("uninstall", help="remove the service, the app shortcut and the skill (keeps your data)")
+    s.add_argument("--dry-run", action="store_true", help="show what would be removed")
+    s.set_defaults(func=cmd_uninstall)
 
     s = sub.add_parser("config", help="show the config file (secrets masked)")
     s.set_defaults(func=cmd_config)
