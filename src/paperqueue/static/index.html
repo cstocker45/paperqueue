@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#151515" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Papers">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>paperqueue</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#list">Skip to papers</a>
+  <div class="page">
+    <header class="masthead">
+      <h1 class="wordmark"><a href="/">paperqueue</a></h1>
+      <p class="summary" id="summary" aria-live="polite"></p>
+    </header>
+
+    <form class="addbar" id="add-form" autocomplete="off">
+      <label class="visually-hidden" for="add-ref">Add a paper</label>
+      <input class="addbar-input" id="add-ref" name="ref" type="text" required
+             placeholder="Paste an arXiv ID, DOI, URL or title" spellcheck="false">
+      <div class="addbar-options">
+        <label class="inline-field">
+          <span class="inline-label">Priority</span>
+          <select id="add-priority" name="priority">
+            <option value="1">High</option>
+            <option value="2" selected>Normal</option>
+            <option value="3">Low</option>
+          </select>
+        </label>
+        <label class="inline-field">
+          <span class="inline-label">Schedule</span>
+          <select id="add-when" name="when">
+            <option value="next" selected>Next free slot</option>
+            <option value="none">None</option>
+          </select>
+        </label>
+        <button class="button button-primary" id="add-submit" type="submit">Add</button>
+      </div>
+    </form>
+
+    <nav class="tabs" aria-label="Views">
+      <button class="tab" type="button" data-view="upcoming" aria-pressed="true">Upcoming <span class="count" data-count="upcoming"></span></button>
+      <button class="tab" type="button" data-view="queue" aria-pressed="false">Queue <span class="count" data-count="queue"></span></button>
+      <button class="tab" type="button" data-view="read" aria-pressed="false">Read <span class="count" data-count="read"></span></button>
+      <span class="tabs-spacer"></span>
+      <label class="visually-hidden" for="search">Search papers</label>
+      <input class="search" id="search" type="search" placeholder="Search" spellcheck="false">
+    </nav>
+
+    <div class="filterbar" id="filterbar" hidden>
+      <span class="filter-label">Tag</span>
+      <button class="chip chip-active" id="tag-clear" type="button" aria-label="Clear tag filter"></button>
+    </div>
+
+    <div class="viewbar" id="viewbar"></div>
+
+    <main id="list" class="list" tabindex="-1" aria-live="polite" aria-busy="true"></main>
+
+    <footer class="footer">
+      <dl class="status-list">
+        <div class="status-row">
+          <dt>Library</dt>
+          <dd><span id="library-status">…</span>
+            <button class="link-button" id="library-sync" type="button">Sync</button></dd>
+        </div>
+        <div class="status-row">
+          <dt>Calendar</dt>
+          <dd><span id="calendar-status">…</span>
+            <button class="link-button" id="calendar-sync" type="button">Re-sync</button></dd>
+        </div>
+        <div class="status-row">
+          <dt>PDFs</dt>
+          <dd><span id="pdf-status">…</span></dd>
+        </div>
+        <div class="status-row">
+          <dt>Bookmarklet</dt>
+          <dd><a class="bookmarklet" id="bookmarklet" href="#" draggable="true">Save to paperqueue</a>
+            <span class="hint">Drag to your bookmarks bar, then click it on any paper page.</span></dd>
+        </div>
+        <div class="status-row">
+          <dt>iPhone</dt>
+          <dd><button class="link-button" id="iphone-open" type="button">Open on iPhone</button></dd>
+        </div>
+      </dl>
+      <p class="colophon">Keys: <kbd>/</kbd> search · <kbd>n</kbd> add a paper · <kbd>1</kbd>–<kbd>3</kbd> switch views</p>
+    </footer>
+  </div>
+
+  <dialog class="dialog" id="schedule-dialog" aria-labelledby="schedule-title">
+    <form method="dialog" class="dialog-body" id="schedule-form">
+      <p class="dialog-kicker">Schedule reading</p>
+      <h2 class="dialog-title" id="schedule-title"></h2>
+      <p class="dialog-current" id="schedule-current"></p>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">Date and time</span>
+          <input type="datetime-local" id="schedule-at" step="300">
+        </label>
+        <label class="field field-narrow">
+          <span class="field-label">Minutes</span>
+          <input type="number" id="schedule-duration" min="5" max="480" step="5" inputmode="numeric">
+        </label>
+      </div>
+      <div class="slot-block">
+        <span class="field-label">Free slots</span>
+        <div class="chips" id="schedule-slots"><span class="hint">Loading…</span></div>
+      </div>
+      <div class="dialog-actions">
+        <button class="button" type="button" id="schedule-next">Next free slot</button>
+        <button class="button button-quiet" type="button" id="schedule-clear">Unschedule</button>
+        <span class="dialog-spacer"></span>
+        <button class="button button-quiet" value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button class="button button-primary" type="button" id="schedule-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog" id="iphone-dialog" aria-labelledby="iphone-title">
+    <form method="dialog" class="dialog-body">
+      <p class="dialog-kicker">Read on the go</p>
+      <h2 class="dialog-title" id="iphone-title">Open on iPhone</h2>
+      <div id="iphone-lan" hidden>
+        <img class="qr" id="iphone-qr" alt="QR code linking to paperqueue on this Mac" width="216" height="216">
+        <ol class="steps">
+          <li>Scan with the iPhone camera while on the same Wi-Fi.</li>
+          <li>In Safari, tap Share, then Add to Home Screen.</li>
+          <li>The link carries your access token, so keep it to yourself.</li>
+        </ol>
+        <p class="hint" id="iphone-urls"></p>
+      </div>
+      <div id="iphone-off" hidden>
+        <ol class="steps">
+          <li>On this Mac, run <code>paperqueue serve --lan</code> and scan the QR code it prints (it also appears here).</li>
+          <li>In Safari on the iPhone, tap Share, then Add to Home Screen for an app-like queue.</li>
+          <li>Reading sessions are already on your iPhone through the iCloud calendar, with a reminder before each one.</li>
+          <li>Cached PDFs are in iCloud Drive, in the <span class="nowrap">PaperQueue</span> folder of the Files app, for offline reading.</li>
+        </ol>
+      </div>
+      <div class="dialog-actions">
+        <span class="dialog-spacer"></span>
+        <button class="button" value="close" type="submit">Done</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>

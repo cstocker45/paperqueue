@@ -1,0 +1,31 @@
+[project]
+name = "paperqueue"
+version = "0.1.0"
+description = "A local reading queue for research papers: Zotero sync, Apple Calendar scheduling (synced to iPhone), a localhost web app, and an MCP server so agents can add and schedule papers."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["papers", "reading-list", "zotero", "mcp", "calendar", "arxiv"]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+    "mcp>=1.2",
+    "segno>=1.6",
+]
+
+[project.scripts]
+paperqueue = "paperqueue.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paperqueue"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

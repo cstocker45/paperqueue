@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Save to paperqueue</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/add.js" defer></script>
+</head>
+<body>
+  <div class="page confirm">
+    <header class="masthead">
+      <h1 class="wordmark"><a href="/">paperqueue</a></h1>
+      <p class="summary">Save to your reading queue</p>
+    </header>
+
+    <section class="confirm-card" aria-labelledby="hint-title">
+      <p class="confirm-kicker" id="hint-kicker">From this page</p>
+      <h2 class="confirm-title" id="hint-title">…</h2>
+      <dl class="confirm-meta" id="hint-meta"></dl>
+      <p class="confirm-abstract" id="hint-abstract" hidden></p>
+    </section>
+
+    <form class="confirm-form" id="save-form" autocomplete="off">
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">Priority</span>
+          <select id="save-priority">
+            <option value="1">High</option>
+            <option value="2" selected>Normal</option>
+            <option value="3">Low</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">Schedule</span>
+          <select id="save-when">
+            <option value="next" selected>Next free slot</option>
+            <option value="none">None, keep in the queue</option>
+            <option value="pick">Pick a time…</option>
+          </select>
+        </label>
+      </div>
+      <label class="field" id="save-at-field" hidden>
+        <span class="field-label">Date and time</span>
+        <input type="datetime-local" id="save-at" step="300">
+      </label>
+      <label class="field">
+        <span class="field-label">Tags, separated by commas</span>
+        <input type="text" id="save-tags" placeholder="e.g. single-cell, methods" spellcheck="false">
+      </label>
+      <div class="confirm-actions">
+        <button class="button button-primary" id="save-button" type="submit">Save</button>
+        <button class="button button-quiet" id="cancel-button" type="button">Cancel</button>
+        <span class="hint">Press <kbd>⌘</kbd> <kbd>Enter</kbd> to save</span>
+      </div>
+    </form>
+
+    <section class="confirm-result" id="result" hidden aria-live="polite">
+      <h2 class="confirm-result-title" id="result-title" tabindex="-1"></h2>
+      <p id="result-when"></p>
+      <p class="hint" id="result-warnings"></p>
+      <div class="confirm-actions">
+        <button class="button button-primary" id="close-button" type="button">Close tab</button>
+        <a class="button button-quiet" href="/">Open the queue</a>
+      </div>
+    </section>
+  </div>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>
