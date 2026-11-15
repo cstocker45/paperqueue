@@ -61,17 +61,45 @@ function setAlarm(app, ev, minutes) {
   }
 }
 
+// True when the event already has exactly the wanted alert (and no sound alarms).
+function alarmsMatch(ev, minutes) {
+  var want = minutes === null || minutes === undefined ? [] : [-Math.abs(minutes)];
+  try {
+    if (ev.soundAlarms().length) {
+      return false;
+    }
+  } catch (e) {
+    // sound alarms are optional
+  }
+  var have = ev.displayAlarms();
+  if (have.length !== want.length) {
+    return false;
+  }
+  for (var i = 0; i < have.length; i++) {
+    if (have[i].triggerInterval() !== want[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function createEvent(app, cal, spec, start, end) {
+  var props = { summary: spec.title, startDate: start, endDate: end, description: spec.notes };
+  if (spec.url) {
+    props.url = spec.url;
+  }
+  var ev = app.Event(props);
+  cal.events.push(ev);
+  setAlarm(app, ev, spec.alert_minutes);
+  return ev.uid();
+}
+
 function upsert(app, cal, spec) {
   var start = new Date(spec.start_ms);
   var end = new Date(spec.end_ms);
   var ev = firstEventByUid(cal, spec.uid);
   if (ev === null) {
-    var props = { summary: spec.title, startDate: start, endDate: end, description: spec.notes };
-    if (spec.url) {
-      props.url = spec.url;
-    }
-    ev = app.Event(props);
-    cal.events.push(ev);
+    return createEvent(app, cal, spec, start, end);
   } else {
     ev.summary = spec.title;
     // Keep start < end at every step: if moving later past the old end, move the end first.
@@ -88,8 +116,18 @@ function upsert(app, cal, spec) {
       ev.url = spec.url;
     }
   }
-  setAlarm(app, ev, spec.alert_minutes);
-  return ev.uid();
+  if (alarmsMatch(ev, spec.alert_minutes)) {
+    return ev.uid();
+  }
+  try {
+    setAlarm(app, ev, spec.alert_minutes);
+    return ev.uid();
+  } catch (e) {
+    // Calendar.app (macOS 26) can refuse to delete alarms on an existing event
+    // ("AppleEvent handler failed"); deleting the whole event works, so recreate it.
+    app.delete(ev);
+    return createEvent(app, cal, spec, start, end);
+  }
 }
 
 function doList(app, cal, req) {
